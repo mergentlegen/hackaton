@@ -20,6 +20,33 @@ from torch.profiler import ProfilerActivity, profile  # noqa: E402
 FIRST, LAST = 7, 10
 
 
+def gaps(prof):
+    """GPU idle time between consecutive kernels inside the profiled window, largest first."""
+    kernels = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+               and e.time_range.end > e.time_range.start]
+    kernels.sort(key=lambda e: e.time_range.start)
+    if not kernels:
+        return
+    begin, end = kernels[0].time_range.start, kernels[-1].time_range.end
+    busy, last_end, found = 0.0, begin, []
+    for k in kernels:
+        start, stop = k.time_range.start, k.time_range.end
+        if start > last_end:
+            found.append((start - last_end, (last_end - begin) / 1e3, prev.name, k.name))
+        busy += max(0.0, stop - max(start, last_end))
+        if stop > last_end:
+            last_end, prev = stop, k
+    span = end - begin
+    n = LAST - FIRST + 1
+    print(f"OPPROF window {span / 1e3 / n:.0f} ms/step, GPU busy {busy / 1e3 / n:.0f} ms/step, "
+          f"idle {(span - busy) / 1e3 / n:.0f} ms/step in {len(found)} gaps")
+    big = sorted(found, key=lambda g: -g[0])[:14]
+    for length, at, before, after in big:
+        print(f"OPPROF gap {length / 1e3:6.1f} ms at {at:7.1f} ms | after {before[:44]} | before {after[:44]}")
+    small = sum(g[0] for g in found if g[0] < 500)
+    print(f"OPPROF gaps under 0.5 ms add up to {small / 1e3 / n:.0f} ms/step")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -63,6 +90,7 @@ def main():
                     shown += 1
                     if shown >= 40:
                         break
+                gaps(prof)
 
     original_init = transformers.Trainer.__init__
 
