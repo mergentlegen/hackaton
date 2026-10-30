@@ -524,7 +524,7 @@ def patch_soup_trainer() -> None:
     except ImportError:
         pass
 
-    # 2. Attach TritonChunkedCausalLMLoss & decoder checkpointing in SFTTrainerWrapper._setup_transformers
+    # 2. Attach TritonChunkedCausalLMLoss, decoder optimizations, and C++ fused AdamW in SFTTrainerWrapper
     try:
         from soup_cli.trainer.sft import SFTTrainerWrapper
         from soup_cli.utils.stream_loss_chunk import causal_lm_of
@@ -559,4 +559,28 @@ def patch_soup_trainer() -> None:
                     self._stream_loss_chunk_hook = hook
 
     SFTTrainerWrapper._setup_transformers = _setup_transformers
+
+    original_build_rewind = getattr(SFTTrainerWrapper, "_build_rewind_trainer", None)
+    if original_build_rewind is not None:
+        def _fast_build_rewind_trainer(self, base_cls, trainer_kwargs, **kwargs):
+            trainer = original_build_rewind(self, base_cls, trainer_kwargs, **kwargs)
+            orig_create_opt = trainer.create_optimizer
+
+            def _create_opt_fused():
+                res = orig_create_opt()
+                opt = getattr(trainer, "optimizer", None)
+                if opt is not None and opt.__class__.__name__ == "AdamW":
+                    try:
+                        for group in opt.param_groups:
+                            group["fused"] = True
+                        opt.fused = True
+                    except Exception:
+                        pass
+                return res
+
+            trainer.create_optimizer = _create_opt_fused
+            return trainer
+
+        SFTTrainerWrapper._build_rewind_trainer = _fast_build_rewind_trainer
+
     SFTTrainerWrapper._soup_triton_ce_patched = True

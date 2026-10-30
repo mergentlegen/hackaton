@@ -11,9 +11,9 @@ from torch.nn import functional as F
 
 _TLS = threading.local()
 
-# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~1.7-1.8 GiB while uncheckpointing more layers
-_ATTN_UNCKPT_BUDGET_MIB = 140.0
-_ATTN_MIB_PER_TOKEN = 0.0105  # ~10.5 KB/token with TritonFusedAttnQKVRoPEFunc (1-byte dropout masks + 2-head KV)
+# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~1.9-2.0 GiB while running ALL layers uncheckpointed
+_ATTN_UNCKPT_BUDGET_MIB = 260.0
+_ATTN_MIB_PER_TOKEN = 0.0100  # ~10 KB/token with TritonFusedAttnQKVRoPEFunc (compact 2-head KV + 1-byte masks)
 
 
 @dataclass
@@ -502,7 +502,6 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
         hv, mask_v = _lora_fwd_inplace(
             normed_2d, qkv_2d[:, dq + dk :], wa_v, wb_v, scale_v, drop_v, comp_dtype
         )
-        del normed_2d
 
         q_in = qkv_2d[:, :dq].view(b, s, h_q, head_dim)
         k_in = qkv_2d[:, dq : dq + dk].view(b, s, h_k, head_dim)
@@ -520,6 +519,7 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
         empty = x_2d[:0, :0]
         ctx.save_for_backward(
             x_2d.detach(),
+            normed_2d.detach(),
             norm_w.detach(),
             r,
             cos_3d,
@@ -562,11 +562,12 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
             return (None,) * 15
 
         from .nf4_linear import _dequant_triple_to_workspace
-        from .rmsnorm import _norm_launch_cfg, rmsnorm_bwd_2d, triton_rmsnorm_fwd
+        from .rmsnorm import _norm_launch_cfg, rmsnorm_bwd_2d
         from .rope import _normalize_cos_sin, launch_qk_rope_bshd_strided
 
         (
             x_2d,
+            normed_2d,
             norm_w,
             r,
             cos_3d,
@@ -635,26 +636,6 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
         need_wa_k, need_wb_k = ctx.needs_input_grad[6], ctx.needs_input_grad[7]
         need_wa_v, need_wb_v = ctx.needs_input_grad[8], ctx.needs_input_grad[9]
         need_normed = need_x or need_norm_w
-
-        normed_2d = None
-        if (has_q and need_wa_q) or (has_k and need_wa_k) or (has_v and need_wa_v):
-            normed_2d = torch.empty((m, d), dtype=comp_dtype, device=x_2d.device)
-            if m > 0:
-                block, warps = _norm_launch_cfg(d)
-                triton_rmsnorm_fwd[(m,)](
-                    x_2d,
-                    x_2d,
-                    normed_2d,
-                    normed_2d,
-                    norm_w,
-                    r,
-                    x_2d.stride(0),
-                    d,
-                    ctx.norm_eps,
-                    0,
-                    BLOCK_SIZE=block,
-                    num_warps=warps,
-                )
 
         grad_wa_q, grad_wb_q, dx_q = _lora_bwd_branch(
             grad_qkv_2d[:, :dq],
@@ -919,7 +900,6 @@ def _fast_qwen2_mlp_forward(
     s_saved: torch.Tensor | None = None,
     norm_w: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
-    add_residual: bool = False,
 ) -> torch.Tensor:
     from .nf4_linear import TritonNF4SwiGLUMLPFunc, _resolve_bnb_compute_dtype, get_valid_4bit_state
 
@@ -947,15 +927,9 @@ def _fast_qwen2_mlp_forward(
                     s_saved,
                     norm_w,
                     norm_eps,
-                    add_residual,
                 )
 
-    out = mlp_mod(hidden_states)
-    if add_residual and s_saved is not None:
-        if out.dtype != s_saved.dtype:
-            out = out.to(s_saved.dtype)
-        return s_saved + out
-    return out
+    return mlp_mod(hidden_states)
 
 
 def _attention_subblock(
@@ -1204,13 +1178,10 @@ def install_model_layer_optimizations(causal_lm: torch.nn.Module) -> None:
                         _layer.post_attention_layernorm.weight,
                         _layer.post_attention_layernorm.variance_epsilon,
                     )
-                    return _fast_qwen2_mlp_forward(
-                        _layer.mlp,
-                        post_normed,
-                        recompute_mode=0,
-                        s_saved=residual,
-                        add_residual=True,
-                    )
+                    mlp_delta = _fast_qwen2_mlp_forward(_layer.mlp, post_normed, recompute_mode=0)
+                    if mlp_delta.dtype != residual.dtype:
+                        mlp_delta = mlp_delta.to(residual.dtype)
+                    return residual + mlp_delta
 
                 # Token-aware dynamic checkpointing for Attention sub-block
                 if packed_ctx is not None:
@@ -1244,20 +1215,20 @@ def install_model_layer_optimizations(causal_lm: torch.nn.Module) -> None:
                     eps_post,
                 )
 
-                # MLP uses recompute_mode=2 + fused residual add (zero AddBackward0 node,
-                # zero extra saved tensors, zero down_proj recompute, 1-launch w_gate_up dequant!)
+                # MLP uses recompute_mode=2 + pure CuBLAS GEMM (zero down_proj recompute, 1-launch w_gate_up dequant!)
                 recomp_mode = 0 if _mlp_trainable else 2
-                out = _fast_qwen2_mlp_forward(
+                mlp_delta = _fast_qwen2_mlp_forward(
                     _layer.mlp,
                     post_normed,
                     recompute_mode=recomp_mode,
                     s_saved=residual,
                     norm_w=w_post,
                     norm_eps=eps_post,
-                    add_residual=True,
                 )
-                del post_normed, residual
-                return out
+                del post_normed
+                if mlp_delta.dtype != residual.dtype:
+                    mlp_delta = mlp_delta.to(residual.dtype)
+                return residual + mlp_delta
 
             return _layer_fwd
 

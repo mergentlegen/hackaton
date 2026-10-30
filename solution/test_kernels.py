@@ -364,6 +364,8 @@ def test_sm75_shared_memory_and_rule_compliance():
     from solution.cross_entropy import triton_fused_chunk_loss_kernel
     from solution.nf4_linear import (
         triton_nf4_dequant_kernel,
+        triton_nf4_dequant_pair_kernel,
+        triton_nf4_dequant_triple_kernel,
         triton_swiglu_packed_kernel,
     )
     from solution.rmsnorm import triton_rmsnorm_bwd, triton_rmsnorm_fwd
@@ -372,6 +374,8 @@ def test_sm75_shared_memory_and_rule_compliance():
     for jit_fn in [
         triton_fused_chunk_loss_kernel,
         triton_nf4_dequant_kernel,
+        triton_nf4_dequant_pair_kernel,
+        triton_nf4_dequant_triple_kernel,
         triton_swiglu_packed_kernel,
         triton_rmsnorm_fwd,
         triton_rmsnorm_bwd,
