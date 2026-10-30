@@ -149,8 +149,8 @@ def register_hooks(model):
 def register_stack_hooks(model):
     for name, module in model.named_modules():
         short = re.sub(r"layers\.\d+", "layers.*", name).replace("base_model.model.", "")
-        module.register_forward_pre_hook(lambda mod, args, n=short: STACK.append(n))
-        module.register_forward_hook(lambda mod, args, out: STACK.pop() if STACK else None)
+        module.register_forward_pre_hook(lambda mod, args, n=(short or "<root>"): STACK.append(n))
+        module.register_forward_hook(lambda mod, args, out: (STACK.pop(), None)[1])
     for param in list(model.parameters()) + list(model.buffers()):
         PARAM_PTRS.add(param.untyped_storage().data_ptr())
 
