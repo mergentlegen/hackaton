@@ -13,49 +13,30 @@ the same (solution/test_nf4.py). The scales must be plain fp32 (not double-quant
 step decodes the 8-bit scales once for good (packed.py `_flatten_quant_states`), anything else
 goes to bitsandbytes.
 
-One lane per output weight, so the fp16 stores are fully coalesced; the 16-entry table and the
-scales are read through the cache.
+One lane per packed byte; the 16-entry table and the scales are read through the cache.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-OUTPUTS = 1024  # weights decoded per program
-WARPS = 8
-VARIANT = 0
-
-
-@triton.jit
-def _nf4_value(code_ptr, nibble, SELECT: tl.constexpr):
-    if SELECT:  # the 16 table values as scalars, picked by a select chain (no gather)
-        value = tl.zeros(nibble.shape, tl.float32) + tl.load(code_ptr)
-        for i in tl.static_range(1, 16):
-            value = tl.where(nibble == i, tl.load(code_ptr + i), value)
-        return value
-    return tl.load(code_ptr + nibble)
+OUTPUTS = 2048  # weights decoded per program (tools/nf4_bench.py: 254 us for 8960 x 1536 on a
+WARPS = 4  # T4, bitsandbytes 225 us; one lane per output was 288-520 us, a select chain slower)
 
 
 @triton.jit(do_not_specialize=["n_out"])
 def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, BLOCKSIZE: tl.constexpr,
-                       OUTPUTS: tl.constexpr, PER_BYTE: tl.constexpr, SELECT: tl.constexpr):
-    if PER_BYTE:  # one lane per byte, two stores at stride 2
-        offs = tl.program_id(0).to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
-        mask = offs < n_out // 2
-        byte = tl.load(packed_ptr + offs, mask=mask, other=0).to(tl.int32)
-        scale = tl.load(absmax_ptr + offs // (BLOCKSIZE // 2), mask=mask, other=0.0)
-        first = _nf4_value(code_ptr, byte >> 4, SELECT) * scale
-        second = _nf4_value(code_ptr, byte & 15, SELECT) * scale
-        tl.store(out_ptr + 2 * offs, first.to(out_ptr.dtype.element_ty), mask=mask)
-        tl.store(out_ptr + 2 * offs + 1, second.to(out_ptr.dtype.element_ty), mask=mask)
-    else:  # one lane per output weight: consecutive lanes store consecutive values
-        offs = tl.program_id(0).to(tl.int64) * OUTPUTS + tl.arange(0, OUTPUTS)
-        mask = offs < n_out
-        byte = tl.load(packed_ptr + offs // 2, mask=mask, other=0).to(tl.int32)
-        nibble = tl.where(offs % 2 == 0, byte >> 4, byte & 15)
-        scale = tl.load(absmax_ptr + offs // BLOCKSIZE, mask=mask, other=0.0)
-        value = _nf4_value(code_ptr, nibble, SELECT) * scale
-        tl.store(out_ptr + offs, value.to(out_ptr.dtype.element_ty), mask=mask)
+                       OUTPUTS: tl.constexpr):
+    # one lane per byte: its two weights are written by two stores at stride 2, which together
+    # cover the same cache lines
+    offs = tl.program_id(0).to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
+    mask = offs < n_out // 2
+    byte = tl.load(packed_ptr + offs, mask=mask, other=0).to(tl.int32)
+    scale = tl.load(absmax_ptr + offs // (BLOCKSIZE // 2), mask=mask, other=0.0)
+    first = tl.load(code_ptr + (byte >> 4)) * scale  # high nibble: the first weight
+    second = tl.load(code_ptr + (byte & 15)) * scale
+    tl.store(out_ptr + 2 * offs, first.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_ptr + 2 * offs + 1, second.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _numel(shape):
@@ -86,7 +67,7 @@ def dequantize_nf4(packed, state):
         code = code.to(device=packed.device, dtype=torch.float32)
     nf4_dequant_kernel[(triton.cdiv(n_out, OUTPUTS),)](
         packed, state.absmax, code, out, n_out, BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS,
-        PER_BYTE=VARIANT in (1, 3), SELECT=VARIANT in (2, 3), num_warps=WARPS)
+        num_warps=WARPS)
     return out
 
 
