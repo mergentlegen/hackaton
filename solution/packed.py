@@ -29,6 +29,26 @@ def _autocast_fp16():
         return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
 
 
+def _fp16_embeddings(model, lm_head):
+    """The embedding table (233M weights, tied with lm_head) is fp32 in Soup's 4-bit setup
+    because peft's kbit preparation casts every non-quantized weight up; but it was loaded from a
+    fp16 checkpoint, so every value is exactly representable in fp16. Storing it as fp16 loses
+    nothing (checked, per chunk) and drops 467 MiB, plus the fp16 copy autocast made of it for the
+    lm_head matmul (445 MiB). Only a frozen fp32 table is touched."""
+    embed = model.embed_tokens
+    if getattr(embed, "_fp16_checked", False):
+        return
+    embed._fp16_checked = True
+    for module in (embed, lm_head):
+        weight = module.weight
+        if weight.dtype != torch.float32 or weight.requires_grad:
+            continue
+        half = weight.data.to(torch.float16)
+        if all(torch.equal(half[i:i + 16384].float(), weight.data[i:i + 16384])
+               for i in range(0, half.shape[0], 16384)):
+            weight.data = half
+
+
 def patch_causal_lm_packed():
     from transformers.modeling_outputs import CausalLMOutputWithPast
     from transformers.models.qwen2 import modeling_qwen2
@@ -57,6 +77,7 @@ def patch_causal_lm_packed():
                             inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
                             logits_to_keep=logits_to_keep, **kwargs)
 
+        _fp16_embeddings(model, self.lm_head)
         batch, seq = input_ids.shape
         device = input_ids.device
         real = attention_mask.to(torch.bool)

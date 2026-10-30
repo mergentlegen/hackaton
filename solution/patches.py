@@ -116,7 +116,9 @@ def patch_qwen2_rmsnorm():
         weight = self.weight
         if (hidden_states.is_cuda and hidden_states.dtype == torch.float32
                 and weight.dtype == torch.float32 and weight.is_cuda):
-            return rms_norm(hidden_states, weight, self.variance_epsilon)
+            # in the fp16 autocast step the consumers cast to fp16 anyway: hand it over as fp16
+            return rms_norm(hidden_states, weight, self.variance_epsilon,
+                            to_half=_autocast_fp16())
         return original(self, hidden_states)
 
     modeling_qwen2.Qwen2RMSNorm.forward = forward

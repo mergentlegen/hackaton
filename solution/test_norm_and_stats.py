@@ -8,7 +8,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 
 @pytest.mark.parametrize("shape", [(4, 334, 1536), (3, 77, 1000)])
 @pytest.mark.parametrize("train_weight", [False, True])
-def test_rms_norm_matches_qwen2(shape, train_weight):
+@pytest.mark.parametrize("to_half", [False, True])
+def test_rms_norm_matches_qwen2(shape, train_weight, to_half):
     from solution.rmsnorm import rms_norm
 
     torch.manual_seed(0)
@@ -16,22 +17,26 @@ def test_rms_norm_matches_qwen2(shape, train_weight):
     weight = (1 + 0.1 * torch.randn(shape[-1], device="cuda")).requires_grad_(train_weight)
     dy = torch.randn(shape, device="cuda")
     eps = 1e-6
+    out_dtype = torch.float16 if to_half else torch.float32
 
     variance = x.pow(2).mean(-1, keepdim=True)
-    ref = weight * (x * torch.rsqrt(variance + eps))
-    ref.backward(dy)
+    ref = (weight * (x * torch.rsqrt(variance + eps))).to(out_dtype)
+    ref.backward(dy.to(out_dtype))
     ref_dx = x.grad.clone()
     ref_dw = weight.grad.clone() if train_weight else None
     x.grad = None
     if train_weight:
         weight.grad = None
 
-    out = rms_norm(x, weight, eps)
-    out.backward(dy)
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-    torch.testing.assert_close(x.grad, ref_dx, rtol=1e-4, atol=1e-5)
+    out = rms_norm(x, weight, eps, to_half)
+    assert out.dtype == out_dtype
+    out.backward(dy.to(out_dtype))
+    tol = 2e-3 if to_half else 1e-5
+    torch.testing.assert_close(out.float(), ref.float(), rtol=tol, atol=tol)
+    torch.testing.assert_close(x.grad, ref_dx, rtol=1e-3 if to_half else 1e-4, atol=1e-3 if to_half else 1e-5)
     if train_weight:
-        torch.testing.assert_close(weight.grad, ref_dw, rtol=1e-4, atol=1e-3)
+        torch.testing.assert_close(weight.grad, ref_dw, rtol=2e-3 if to_half else 1e-4,
+                                   atol=3e-2 if to_half else 1e-3)
 
 
 def test_entropy_matches_trl():
