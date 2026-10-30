@@ -156,3 +156,25 @@ def patch_logit_metrics():
             return row_cross_entropy(logits, labels)
 
     rewind_hf.row_losses = row_losses
+
+
+def patch_trainer_flops():
+    """transformers' Trainer calls `floating_point_ops` after every step, and that walks all ~930
+    modules of the PEFT model twice (`num_parameters(exclude_embeddings=True)`) to get a number
+    that never changes. Same number, computed once per trainer (~15 ms of every step)."""
+    import transformers
+
+    original = transformers.Trainer.floating_point_ops
+
+    def floating_point_ops(self, inputs):
+        model = self.model
+        name = getattr(model, "main_input_name", "input_ids")
+        if name not in inputs or not hasattr(model, "num_parameters"):
+            return original(self, inputs)
+        params = self.__dict__.get("_non_embedding_parameters")
+        if params is None:
+            params = model.num_parameters(exclude_embeddings=True)
+            self.__dict__["_non_embedding_parameters"] = params
+        return 6 * inputs[name].numel() * params
+
+    transformers.Trainer.floating_point_ops = floating_point_ops
