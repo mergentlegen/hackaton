@@ -243,3 +243,26 @@ def patch_kbit_preparation():
     for namespace in (peft_utils, peft_other):
         if getattr(namespace, "prepare_model_for_kbit_training", None) is original:
             namespace.prepare_model_for_kbit_training = prepare
+
+
+def patch_nf4_matmul():
+    """bitsandbytes' 4-bit matmul (every Linear4bit forward calls `bnb.matmul_4bit`) through
+    our NF4 decode kernel (nf4.py) when the weight is NF4 with plain fp32 scales and the input
+    is a batch of rows in the weight's compute dtype; anything else goes to bitsandbytes."""
+    import bitsandbytes as bnb
+
+    from .nf4 import can_dequantize, nf4_linear
+
+    original = bnb.matmul_4bit
+
+    def matmul_4bit(A, B, quant_state, out=None, bias=None):
+        state = quant_state
+        if (out is None and state is not None and isinstance(A, torch.Tensor) and A.is_cuda
+                and A.dim() >= 2 and A.numel() // max(A.shape[-1], 1) > 4
+                and len(getattr(state, "shape", ())) == 2 and A.shape[-1] == state.shape[1]
+                and A.dtype == state.dtype and can_dequantize(B, state)
+                and (bias is None or bias.dtype == A.dtype)):
+            return nf4_linear(A, B, bias, state)
+        return original(A, B, quant_state, out=out, bias=bias)
+
+    bnb.matmul_4bit = matmul_4bit
