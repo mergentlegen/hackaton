@@ -16,13 +16,15 @@
 ## Our kernels
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `triton_nf4_dequant_kernel` | `solution/nf4_linear.py` | `bitsandbytes` 2-stage 4-bit NF4/FP4 double-quant dequantization into a unified 55.6 MiB workspace for stacked `[gate; up]` & `[q; k; v]` GEMMs | `7.66%` |
-| `triton_swiglu_packed_kernel` | `solution/nf4_linear.py` | Unified 2D packed `[M, 2*I]` SwiGLU forward and in-place `[d_gate \| d_up]` backward | `2.91%` |
-| `triton_fused_chunk_loss_kernel` | `solution/cross_entropy.py` | Full `[B, S, 151936]` logits + FP32 CrossEntropy + TRL `entropy_from_logits` + token accuracy + backward `dlogits` (chunked 2-pass online softmax + in-place unscaled FP16 grad) | `0.89%` |
-| `triton_qk_rope_kernel` | `solution/rope.py` | Unified fwd/bwd zero-transpose stride-native fused Q+K RoPE across all 14 heads in 1 launch | `0.84%` |
-| `triton_rmsnorm_fwd` | `solution/rmsnorm.py` | Unified `Qwen2RMSNorm` & fused `residual + attn_delta` + `post_attention_layernorm` forward | `0.75%` |
-| `triton_rmsnorm_bwd` | `solution/rmsnorm.py` | Unified `Qwen2RMSNorm` & fused residual + RMSNorm backward using 4-byte `rstd` | `0.48%` |
-| **Total own kernels (excluding `example_swiglu_*`)** | `solution/` | End-to-end non-GEMM compute & dequantization | **`13.5%`** |
+| `triton_nf4_dequant_pair_kernel` | `solution/nf4_linear.py` | Fused 2-matrix (gate+up) single-launch NF4/FP4 double-quant dequantizer into unified workspace | `6.63%` |
+| `triton_swiglu_packed_kernel` | `solution/nf4_linear.py` | Unified 2D packed `[M, 2*I]` SwiGLU forward and in-place `[d_gate \| d_up]` backward | `4.45%` |
+| `triton_nf4_dequant_kernel` | `solution/nf4_linear.py` | Ultra-fast single-matrix 4-bit NF4/FP4 double-quant dequantizer for down_proj & o_proj | `3.53%` |
+| `triton_nf4_dequant_triple_kernel` | `solution/nf4_linear.py` | Fused 3-matrix (Q+K+V) single-launch NF4/FP4 double-quant dequantizer | `2.01%` |
+| `triton_fused_chunk_loss_kernel` | `solution/cross_entropy.py` | Full `[B, S, 151936]` logits + FP32 CrossEntropy + TRL `entropy_from_logits` + token accuracy + backward `dlogits` | `1.25%` |
+| `triton_rmsnorm_fwd` | `solution/rmsnorm.py` | Unified `Qwen2RMSNorm` & fused `residual + attn_delta` + `post_attention_layernorm` forward | `0.93%` |
+| `triton_qk_rope_kernel` | `solution/rope.py` | Unified fwd/bwd zero-transpose stride-native fused Q+K RoPE across all 14 heads in 1 launch | `0.86%` |
+| `triton_rmsnorm_bwd` | `solution/rmsnorm.py` | Unified `Qwen2RMSNorm` & fused residual + RMSNorm backward using 4-byte `rstd` | `0.71%` |
+| **Total own kernels (excluding `example_swiglu_*`)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`16.1%`** |
 
 Ideas taken from other kernels, with links (we wrote all code in `solution/` ourselves):
 - **Online Softmax / Streaming LogSumExp**: Milakov & Gimelshein (2018), [arXiv:1805.02867](https://arxiv.org/abs/1805.02867), and Dao et al., [FlashAttention](https://arxiv.org/abs/2205.14135) — extended to compute streaming Shannon entropy alongside NLL loss and `argmax` in `triton_fused_chunk_loss_kernel`.
@@ -33,9 +35,11 @@ Ideas taken from other kernels, with links (we wrote all code in `solution/` our
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | `90.20` | `57.24` | speedup `1.576`x |
-| Peak GPU memory, MiB | `14345` | `1849` | base/ours `7.758`x |
-| Eval loss (public rows) | `2.04966` | `2.04985` | `+0.009`% vs base |
+| Time of `soup train`, s | `88.70` | `54.15` | speedup `1.638`x |
+| Training loop, s | `54.13` | `31.36` | speedup `1.726`x |
+| Median step, s | `0.8786` | `0.3885` | speedup `2.262`x |
+| Peak GPU memory, MiB | `14345` | `2265` | base/ours `6.333`x |
+| Eval loss (public rows) | `2.04966` | `2.04981` | `+0.007`% vs base |
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits

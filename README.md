@@ -27,16 +27,19 @@ Profiling `soup-cli==0.77.0` + `transformers==5.16.1` + `peft==0.20.0` + `trl==0
 
 ### Our Architecture & Custom `@triton.jit` Kernels (`solution/`)
 
-Everything plugs in through `solution.apply()` with **zero banned libraries**, **zero changes to `TRAINER_ARGS`**, and **zero `@triton.autotune`** (6 unified kernels using `@triton.jit(do_not_specialize=...)` so each compiles **exactly once** on cold start; every compiled kernel uses $\le 64\text{ B}$ shared memory vs SM75's $64\text{ KiB}$ limit):
+Everything plugs in through `solution.apply()` with **zero banned libraries**, **zero changes to `TRAINER_ARGS`**, and **zero `@triton.autotune`** (8 specialized kernels using `@triton.jit(do_not_specialize=...)` so each compiles **exactly once** on cold start; every compiled kernel uses $\le 64\text{ B}$ shared memory vs SM75's $64\text{ KiB}$ limit):
 
-| `@triton.jit` Kernel | File | What It Replaces & How It Works |
-|---|---|---|
-| `triton_nf4_dequant_kernel` | `solution/nf4_linear.py` | **Single-pass 4-bit NF4/FP4 single & nested double-quant dequantizer** (`7.66%` share). Unpacks two nibbles per byte, resolves nested `absmax` (`s2_code[qabs] * s2_absmax + offset`) in registers, interleaves `(hi, lo)` via `tl.join`, and writes stacked `[gate; up]` (`52.5 MiB`) or `[q; k; v]` (`6.0 MiB`) weights into a unified shared workspace (`55.6 MiB`) for single-GEMM forward & backward projections. |
-| `triton_swiglu_packed_kernel` | `solution/nf4_linear.py` | **Unified 2D packed `[M, 2*I]` SwiGLU forward & in-place backward kernel** (`2.91%` share). Reads stacked `[gate \| up]` directly in forward and overwrites `[gate \| up]` in-place with `[d_gate \| d_up]` in backward, enabling a single `[M, 17920] @ [17920, 1536]` backward GEMM with zero transient `d_gate`/`d_up` allocations. |
-| `triton_fused_chunk_loss_kernel` | `solution/cross_entropy.py` | **2-pass online-softmax Cross-Entropy + exact token Shannon entropy + token accuracy (`argmax`) + in-place unscaled `dlogits`** (`0.89%` share). Processes hidden states in `[192, 1536]` chunks into the same shared `55.6 MiB` FP16 workspace, never materializing `[B, S, V]` logits, and writes `d_hidden` directly via `matmul(..., out=hidden_grad_buf[start:stop])`. |
-| `triton_qk_rope_kernel` | `solution/rope.py` | **Unified forward/backward zero-transpose stride-native fused Q+K Rotary Position Embedding** (`0.84%` share). Launches over `(B*S, H_q + H_kv)` (`14` heads in one launch) directly on contiguous `BSHD` or strided `BHSD` tensors without `.transpose()` copies or `torch.cat` allocations. |
-| `triton_rmsnorm_fwd` | `solution/rmsnorm.py` | **Unified RMSNorm & Fused Residual-Add + Post-Attention RMSNorm forward** (`0.75%` share). Fuses `s = residual + attn_delta` and `post_norm(s)` into one HBM pass, caching only 1 FP32 `rstd` scalar per token (`4 B`). |
-| `triton_rmsnorm_bwd` | `solution/rmsnorm.py` | **Unified RMSNorm & Fused Residual-Add + RMSNorm backward** (`0.48%` share). Merges upstream residual + norm gradients in a single HBM pass. |
+| `@triton.jit` Kernel | File | What It Replaces & How It Works | Share (Check 4) |
+|---|---|---|---|
+| `triton_nf4_dequant_pair_kernel` | `solution/nf4_linear.py` | **Fused 2-matrix (gate+up) single-launch NF4/FP4 double-quant dequantizer**. Unpacks two nibbles per byte, resolves nested `absmax` in registers, interleaves `(hi, lo)` via `tl.join`, and writes stacked `[gate; up]` weights into a unified shared workspace for single-launch forward and backward MLP GEMMs. | **`6.63%`** |
+| `triton_swiglu_packed_kernel` | `solution/nf4_linear.py` | **Unified 2D packed `[M, 2*I]` SwiGLU forward & in-place backward kernel**. Reads stacked `[gate \| up]` directly in forward and overwrites `[gate \| up]` in-place with `[d_gate \| d_up]` in backward, enabling a single `[M, 17920] @ [17920, 1536]` backward GEMM with zero transient `d_gate`/`d_up` allocations. | **`4.45%`** |
+| `triton_nf4_dequant_kernel` | `solution/nf4_linear.py` | **Single-pass 4-bit NF4/FP4 single & nested double-quant dequantizer**. Ultra-lean 32-register kernel for `down_proj` and `o_proj` projections. | **`3.53%`** |
+| `triton_nf4_dequant_triple_kernel` | `solution/nf4_linear.py` | **Fused 3-matrix (Q+K+V) single-launch NF4/FP4 double-quant dequantizer**. Dequantizes Q, K, V simultaneously into unified workspace in forward and backward in 1 single kernel launch. | **`2.01%`** |
+| `triton_fused_chunk_loss_kernel` | `solution/cross_entropy.py` | **2-pass online-softmax Cross-Entropy + exact token Shannon entropy + token accuracy (`argmax`) + in-place unscaled `dlogits`**. Processes hidden states in `[192, 1536]` chunks into the same shared FP16 workspace, never materializing `[B, S, V]` logits, and writes `d_hidden` directly via `matmul(..., out=hidden_grad_buf[start:stop])`. | **`1.25%`** |
+| `triton_rmsnorm_fwd` | `solution/rmsnorm.py` | **Unified RMSNorm & Fused Residual-Add + Post-Attention RMSNorm forward**. Fuses `s = residual + attn_delta` and `post_norm(s)` into one HBM pass, caching only 1 FP32 `rstd` scalar per token (`4 B`). | **`0.93%`** |
+| `triton_qk_rope_kernel` | `solution/rope.py` | **Unified forward/backward zero-transpose stride-native fused Q+K Rotary Position Embedding**. Launches over `(B*S, H_q + H_kv)` (`14` heads in one launch) directly on contiguous `BSHD` or strided `BHSD` tensors without `.transpose()` copies or `torch.cat` allocations. | **`0.86%`** |
+| `triton_rmsnorm_bwd` | `solution/rmsnorm.py` | **Unified RMSNorm & Fused Residual-Add + RMSNorm backward**. Merges upstream residual + norm gradients in a single HBM pass. | **`0.71%`** |
+| **Total own kernels (excluding `example_swiglu_*`)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`16.1%`** |
 
 ### Memory & Compute System Optimizations Around Our Kernels
 - **In-Batch Valid-Token Compaction (`solution/padding.py`)**: Compacts right-padded `(B, S)` inputs within each batch (never mixing rows across batches) into `(1, N_valid)` with exact per-row `position_ids` resets, skipping ~57% wasted padding FLOPs and activation memory across all 28 layers and the LM head, then scatters 1D `token_entropy` and `token_loss` (`8 KiB`) back to `(B, S)` for exact TRL and `rewind.jsonl` parity.
@@ -85,14 +88,14 @@ python harness/score.py runs/result.json        # prints speedup (s), memory rat
 
 ### Results on Kaggle Tesla T4 (`runs/result.json` & `runs/checks.json`)
 
-| Metric | Base Soup 0.77.0 | Our Solution (v2) | Improvement / Delta |
+| Metric | Base Soup 0.77.0 | Our Solution (v6) | Improvement / Delta |
 |---|---|---|---|
-| Whole `soup train` wall time (`wall_s`) | `90.20` s | **`57.24` s** | **`1.576x` faster** |
-| 64-step training loop (`train_loop_s`) | `55.53` s | **`35.30` s** | **`1.573x` faster** |
-| Median step time (`median_step_s`) | `0.8786` s | **`0.4605` s** | **`1.908x` faster** |
-| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`1,849` MiB** | **`7.758x` lower** |
-| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04985`** | **`+0.009%` vs base** ($\le +0.5\%$ allowed) |
-| Own `@triton.jit` share of training time (Check 4, steps 3+) | — | **`13.5%`** | $\ge 5.0\%$ required |
+| Whole `soup train` wall time (`wall_s`) | `88.70` s | **`54.15` s** | **`1.638x` faster** |
+| 64-step training loop (`train_loop_s`) | `54.13` s | **`31.36` s** | **`1.726x` faster** |
+| Median step time (`median_step_s`) | `0.8786` s | **`0.3885` s** | **`2.262x` faster** |
+| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`2,265` MiB** | **`6.333x` lower** |
+| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04981`** | **`+0.007%` vs base** ($\le +0.5\%$ allowed) |
+| Own `@triton.jit` share of training time (Check 4, steps 3+) | — | **`16.1%`** | $\ge 5.0\%$ required |
 | `harness/check_rules.py` (10 / 10 checks + 79 Soup tests) | — | **10 / 10 PASS** | Admission passed |
 
 ### Limitations & Where Further Gains Stop
