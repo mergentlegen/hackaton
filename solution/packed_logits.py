@@ -10,17 +10,24 @@ into it, and TRL then slices and copies it once more to shift it by one position
 `[..., :-1, :]`, `.contiguous()`, `.argmax(-1)`) from the packed rows, and for anything else it
 builds the real padded tensor on demand (`dense()`), so an access we did not foresee still works.
 The packed logits are the same memory the loss saved for its backward, so this adds nothing.
+
+Under fp16 mixed precision, accelerate converts every fp16 tensor of the model output to fp32
+(`convert_to_fp32` -> `.float()`) before the trainer sees it: for the real padded tensor that is a
+(batch, length, vocab) fp32 copy, 1.5-2.4 GiB on this task. `float()` here returns the same
+packed logits presented as fp32 instead: fp16 -> fp32 is exact, and every metric above already
+computes in fp32 from the fp16 values, so the numbers are those of the fp32 copy.
 """
 
 import torch
 
 
 class PackedLogits:
-    def __init__(self, packed, rows, batch, seq, lo=0, hi=None):
+    def __init__(self, packed, rows, batch, seq, lo=0, hi=None, dtype=None):
         self.packed = packed  # (N, vocab), detached
         self.rows = rows  # (N,) flat index b * seq + t of each real token
         self.batch, self.seq = batch, seq
         self.lo, self.hi = lo, seq if hi is None else hi  # window of positions still visible
+        self._dtype = packed.dtype if dtype is None else dtype  # the dtype it presents
         self._dense = None
 
     # ---- what a tensor of shape (batch, window, vocab) answers ----------------------------
@@ -40,7 +47,7 @@ class PackedLogits:
 
     @property
     def dtype(self):
-        return self.packed.dtype
+        return self._dtype
 
     @property
     def device(self):
@@ -54,6 +61,16 @@ class PackedLogits:
     def contiguous(self, *args, **kwargs):
         return self
 
+    def _as(self, dtype):
+        if dtype == self._dtype:
+            return self
+        return PackedLogits(self.packed, self.rows, self.batch, self.seq, self.lo, self.hi, dtype)
+
+    def float(self):
+        """fp32 view: the values are exact (see the module docstring), nothing is copied."""
+        return self._as(torch.float32) if self.packed.dtype in (torch.float16, torch.float32) \
+            else self.dense().float()
+
     def __getitem__(self, key):
         """`logits[..., a:b, :]` or `logits[:, a:b, :]`: a window over the positions."""
         if not isinstance(key, tuple):
@@ -66,7 +83,7 @@ class PackedLogits:
             window = range(self.lo, self.hi)[key[1]]
             if len(window) and window.step == 1:
                 return PackedLogits(self.packed, self.rows, self.batch, self.seq, window.start,
-                                    window.stop)
+                                    window.stop, self._dtype)
         return self.dense()[key]
 
     def argmax(self, dim=None, keepdim=False):
@@ -81,15 +98,15 @@ class PackedLogits:
     def dense(self):
         if self._dense is None:
             vocab = self.packed.shape[-1]
-            full = torch.zeros(self.batch * self.seq, vocab, dtype=self.packed.dtype,
+            full = torch.zeros(self.batch * self.seq, vocab, dtype=self._dtype,
                                device=self.packed.device)
-            full.index_copy_(0, self.rows, self.packed)
+            full.index_copy_(0, self.rows, self.packed.to(self._dtype))
             self._dense = full.view(self.batch, self.seq, vocab)[:, self.lo:self.hi]
         return self._dense
 
     def __getattr__(self, name):
         if name.startswith("__") or name in ("packed", "rows", "batch", "seq", "lo", "hi",
-                                             "_dense"):
+                                             "_dtype", "_dense"):
             raise AttributeError(name)
         return getattr(self.dense(), name)
 
