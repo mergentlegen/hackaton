@@ -34,12 +34,12 @@ def main():
     gbs = weight.numel() * 2.5 / ms / 1e6
     print(f"bitsandbytes   {ms * 1000:7.1f} us  {gbs:6.1f} GB/s")
     reference = F.dequantize_4bit(packed, state)
-    for outputs in (1024, 2048, 4096):
+    for words in (128, 256, 512):
         for warps in (4, 8):
-            nf4.OUTPUTS, nf4.WARPS = outputs, warps
+            nf4.WORDS, nf4.WARPS = words, warps
             ms = timed(lambda: nf4.dequantize_nf4(packed, state))
             same = torch.equal(nf4.dequantize_nf4(packed, state), reference)
-            print(f"ours {outputs:5d}/{warps}  {ms * 1000:7.1f} us  "
+            print(f"ours {words:5d}/{warps}  {ms * 1000:7.1f} us  "
                   f"{weight.numel() * 2.5 / ms / 1e6:6.1f} GB/s  same={same}")
 
 if __name__ == "__main__":

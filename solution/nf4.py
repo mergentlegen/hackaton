@@ -13,32 +13,35 @@ the same (solution/test_nf4.py). The scales must be plain fp32 (not double-quant
 step decodes the 8-bit scales once for good (packed.py `_flatten_quant_states`), anything else
 goes to bitsandbytes.
 
-One lane per packed byte; the 16-entry table and the scales are read through the cache.
+One lane per 32-bit word of packed bytes (8 weights, one vector store); the 16-entry table and
+the scales are read through the cache.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-OUTPUTS = 2048  # weights decoded per program (tools/nf4_bench.py: 254 us for 8960 x 1536 on a
-WARPS = 4  # T4, bitsandbytes 225 us; one lane per output was 288-520 us, a select chain slower)
+WORDS = 256  # 32-bit words (8 weights each) per program; tools/nf4_variants.py on a T4,
+WARPS = 8  # 8960 x 1536: 165 us (208 GB/s), bitsandbytes 209 us, one lane per byte 254 us
 
 
 @triton.jit(do_not_specialize=["n_out", "_i1", "_i2", "_i3", "_i4"])
 def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, _p4, _p5, _p6, _p7, _p8, _p9,
                        n_out, _i1, _i2, _i3, _i4, _f, BLOCKSIZE: tl.constexpr,
-                       OUTPUTS: tl.constexpr, _c2: tl.constexpr, _c3: tl.constexpr):
+                       WORDS: tl.constexpr, _c2: tl.constexpr, _c3: tl.constexpr):
     # (the argument layout shared by all our kernels: see kernels.py)
-    # one lane per byte: its two weights are written by two stores at stride 2, which together
-    # cover the same cache lines
-    offs = tl.program_id(0).to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
-    mask = offs < n_out // 2
-    byte = tl.load(packed_ptr + offs, mask=mask, other=0).to(tl.int32)
-    scale = tl.load(absmax_ptr + offs // (BLOCKSIZE // 2), mask=mask, other=0.0)
-    first = tl.load(code_ptr + (byte >> 4)) * scale  # high nibble: the first weight
-    second = tl.load(code_ptr + (byte & 15)) * scale
-    tl.store(out_ptr + 2 * offs, first.to(out_ptr.dtype.element_ty), mask=mask)
-    tl.store(out_ptr + 2 * offs + 1, second.to(out_ptr.dtype.element_ty), mask=mask)
+    # One lane per 32-bit word of packed bytes: 8 weights, stored as 8 contiguous values (one
+    # vector store). Byte k of a (little-endian) word holds weights 2k (high nibble) and 2k + 1.
+    w = tl.program_id(0).to(tl.int64) * WORDS + tl.arange(0, WORDS)
+    mask = w < n_out // 8
+    word = tl.load(packed_ptr.to(tl.pointer_type(tl.int32)) + w, mask=mask, other=0)
+    scale = tl.load(absmax_ptr + w // (BLOCKSIZE // 8), mask=mask, other=0.0)
+    k = tl.arange(0, 8)
+    shift = (k // 2) * 8 + (1 - k % 2) * 4
+    nibble = (word[:, None] >> shift[None, :]) & 15
+    value = tl.load(code_ptr + nibble) * scale[:, None]
+    at = w[:, None] * 8 + k[None, :]
+    tl.store(out_ptr + at, value.to(out_ptr.dtype.element_ty), mask=mask[:, None])
 
 
 def _numel(shape):
@@ -56,7 +59,8 @@ def can_dequantize(packed, state):
             and getattr(state, "quant_type", None) == "nf4" and not getattr(state, "nested", True)
             and isinstance(absmax, torch.Tensor) and absmax.dtype == torch.float32
             and absmax.is_cuda and isinstance(code, torch.Tensor) and code.numel() == 16
-            and blocksize % 2 == 0 and blocksize > 0 and packed.numel() * 2 == _numel(state.shape)
+            and blocksize % 8 == 0 and packed.numel() * 2 == _numel(state.shape)
+            and _numel(state.shape) % 8 == 0 and packed.data_ptr() % 4 == 0
             and getattr(state, "dtype", None) in (torch.float16, torch.bfloat16, torch.float32))
 
 
@@ -67,9 +71,9 @@ def dequantize_nf4(packed, state):
     code = state.code
     if code.device != packed.device or code.dtype != torch.float32:
         code = code.to(device=packed.device, dtype=torch.float32)
-    nf4_dequant_kernel[(triton.cdiv(n_out, OUTPUTS),)](
+    nf4_dequant_kernel[(triton.cdiv(n_out // 8, WORDS),)](
         packed, state.absmax, code, out, *[out] * 6, n_out, 0, 0, 0, 0, 0.0,
-        BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS, _c2=0, _c3=0, num_warps=WARPS)
+        BLOCKSIZE=state.blocksize, WORDS=WORDS, _c2=0, _c3=0, num_warps=WARPS)
     return out
 
 
