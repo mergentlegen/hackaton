@@ -9,8 +9,12 @@ Everything the decoder layers of the packed step keep for their backward goes to
   inputs of lora_A) goes through `pack` / `unpack` (torch.autograd.graph.saved_tensors_hooks).
 
 forward:  an item is copied to pinned host memory on a separate copy stream once `KEEP_BYTES` of
-          newer items exist (the newest stay on the GPU: the backward needs them first); its GPU
-          memory is released when the copy is done (`record_stream`).
+          newer items exist (the newest stay on the GPU: the backward needs them first). Its GPU
+          memory is released `LAG_BYTES` of copies later, after the compute stream has been told
+          to wait for that copy: from then on the block is free for the compute stream in stream
+          order, like any other freed tensor. (`record_stream` instead keeps a freed block out of
+          reach until the CPU sees the copy done, and the CPU runs far ahead of the GPU, so the
+          allocator kept asking CUDA for new memory: 670 MiB more reserved than allocated.)
 backward: `load()` returns an item and keeps `PREFETCH_BYTES` of the next items (in backward
           order) on their way back, so they arrive while the GPU computes; the compute stream
           only waits for the copy of what it uses.
@@ -23,6 +27,7 @@ every step (bump allocation): pinning happens only when a step needs more than a
 import torch
 
 KEEP_BYTES = 96 << 20  # newest bytes left on the GPU at the end of the forward
+LAG_BYTES = 64 << 20  # copies in flight before the compute stream waits for the oldest
 PREFETCH_BYTES = 160 << 20  # bytes on their way back ahead of the backward
 MIN_BYTES = 256 << 10  # smaller saved tensors stay where they are
 CHUNK = 256 << 20  # bytes of pinned host memory per chunk
@@ -47,6 +52,7 @@ class Offloader:
         self.chunk = self.offset = 0
         self.evict_next = self.resident = 0
         self.fetch_next = -1
+        self.copying, self.copying_bytes = [], 0  # (done event, gpu tensors, bytes) in flight
 
     # ---- step boundaries (packed.py) ----------------------------------------------------
     def begin(self, device):
@@ -60,6 +66,7 @@ class Offloader:
     def end(self):
         self.active = False
         self.fetch_next = len(self.items) - 1
+        self._release(0)
 
     def wants(self, *tensors):
         """Offload these (for a backward that will need them)?"""
@@ -113,9 +120,21 @@ class Offloader:
             for tensor in item.tensors:
                 buffer = self._host_buffer(tensor)
                 buffer.copy_(tensor, non_blocking=True)
-                tensor.record_stream(self.stream)  # its memory is free once the copy is done
                 host.append(buffer)
+            done = self.stream.record_event()
+        self.copying.append((done, item.tensors, item.nbytes))
+        self.copying_bytes += item.nbytes
         item.host, item.tensors = host, None
+        self._release(LAG_BYTES)
+
+    def _release(self, keep_bytes):
+        """Free the GPU side of the oldest copies, newest `keep_bytes` excepted: the compute
+        stream waits for each copy first, so its memory is free in compute-stream order."""
+        compute = torch.cuda.current_stream()
+        while self.copying and self.copying_bytes > keep_bytes:
+            done, _tensors, nbytes = self.copying.pop(0)
+            compute.wait_event(done)
+            self.copying_bytes -= nbytes
 
     # ---- backward -----------------------------------------------------------------------
     def _to_device(self, item):
