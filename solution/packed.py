@@ -39,6 +39,7 @@ def _fp16_embeddings(model, lm_head):
     if getattr(embed, "_fp16_checked", False):
         return
     embed._fp16_checked = True
+    _flatten_quant_states(model)
     for module in (embed, lm_head):
         weight = module.weight
         if weight.dtype != torch.float32 or weight.requires_grad:
@@ -47,6 +48,31 @@ def _fp16_embeddings(model, lm_head):
         if all(torch.equal(half[i:i + 16384].float(), weight.data[i:i + 16384])
                for i in range(0, half.shape[0], 16384)):
             weight.data = half
+
+
+def _flatten_quant_states(model):
+    """bitsandbytes' 4-bit weights use double quantization: the per-block scales (`absmax`) are
+    themselves stored 8-bit and decoded (a dequantize kernel plus an add kernel) inside every
+    single matmul, forward and backward, 2 x 196 times per step, always to the same fp32 values.
+    Decode them once; bitsandbytes' own CPU path does exactly this permanent conversion
+    (`quant_state.nested = False`), and its non-nested GPU path then reads them directly."""
+    try:
+        import bitsandbytes as bnb
+        from bitsandbytes import functional as bnb_functional
+    except ImportError:
+        return
+    for module in model.modules():
+        if not isinstance(module, bnb.nn.Linear4bit):
+            continue
+        state = getattr(module.weight, "quant_state", None)
+        if state is None or not getattr(state, "nested", False):
+            continue
+        absmax = bnb_functional.dequantize_blockwise(state.absmax, state.state2)
+        absmax += state.offset
+        if absmax.dtype != torch.float32:
+            absmax = absmax.float()
+        state.absmax = absmax
+        state.nested = False
 
 
 def patch_causal_lm_packed():
