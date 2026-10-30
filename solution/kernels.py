@@ -94,9 +94,9 @@ def silu_mul(gate, up):
 # per row is kept. The same pass gives the entropy of the softmax (TRL logs it) and the argmax
 # (first maximal index, like torch.argmax; TRL's token accuracy) when asked: `want` bit 1 and 2.
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["want"])
-def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, vocab,
-                    want, BLOCK: tl.constexpr):
+@triton.jit
+def _ce_stats(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, vocab, want,
+              BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     target = tl.load(target_ptr + row)
     base = logits_ptr + row * vocab
@@ -134,8 +134,7 @@ def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argm
 
 
 @triton.jit
-def ce_backward_kernel(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, vocab,
-                       BLOCK: tl.constexpr):
+def _ce_backward(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, vocab, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     target = tl.load(target_ptr + row)
     lse = tl.load(lse_ptr + row)
@@ -153,6 +152,27 @@ def ce_backward_kernel(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, voc
         tl.store(out + idx, grad.to(grad_ptr.dtype.element_ty), mask=mask)
 
 
+# One compiled kernel for both passes (each compile costs 0.3-0.6 s of the measured run): mode
+# 0-3 is the statistics pass with `want` = mode, mode 4 the gradient pass. Arguments one pass does
+# not use get tensors of the same dtypes, so both calls share the compiled kernel.
+@triton.jit(do_not_specialize=["mode"])
+def ce_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, scale_ptr,
+              grad_ptr, vocab, mode, BLOCK: tl.constexpr):
+    if mode == 4:
+        _ce_backward(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, vocab, BLOCK)
+    else:
+        _ce_stats(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, vocab, mode,
+                  BLOCK)
+
+
+def ce_grad(logits, targets, lse, scale, grad):
+    """grad = scale * (softmax(logits) - onehot(targets)) per row, 0 for rows with target < 0;
+    `grad` may be `logits` itself (each element is read before it is overwritten)."""
+    rows, vocab = logits.shape
+    ce_kernel[(rows,)](logits, targets, lse, lse, lse, targets, scale, grad, vocab, 4,
+                       BLOCK=CE_BLOCK, num_warps=8)
+
+
 def ce_stats(logits, targets, want_entropy, out=None):
     """Per-row logsumexp, loss (0 for rows with target < 0) and, if asked, entropy of (rows,
     vocab) logits. `out` = (lse, loss, entropy, argmax) buffers to fill, argmax included."""
@@ -166,8 +186,9 @@ def ce_stats(logits, targets, want_entropy, out=None):
         entropy = torch.empty_like(lse) if want_entropy else lse
         argmax = targets  # not written
         want = int(want_entropy)
-    ce_stats_kernel[(rows,)](logits, targets, lse, loss, entropy, argmax, vocab, want,
-                             BLOCK=CE_BLOCK, num_warps=8)
+    scale = lse  # unused by the statistics pass
+    ce_kernel[(rows,)](logits, targets, lse, loss, entropy, argmax, scale, logits, vocab, want,
+                       BLOCK=CE_BLOCK, num_warps=8)
     return lse, loss, (entropy if want % 2 else None)
 
 
@@ -192,8 +213,7 @@ class FusedCrossEntropy(torch.autograd.Function):
         rows, vocab = logits.shape
         scale = (grad_output / denom).to(torch.float32).reshape(1)
         grad = logits if ctx.inplace_grad else torch.empty_like(logits)
-        ce_backward_kernel[(rows,)](logits, targets, lse, scale, grad, vocab, BLOCK=CE_BLOCK,
-                                    num_warps=8)
+        ce_grad(logits, targets, lse, scale, grad)
         return grad, None, None, None
 
 

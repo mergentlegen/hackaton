@@ -9,8 +9,8 @@ that is linear in the incoming gradient:
 
 so it is computed in the forward, chunk by chunk, with grad_output applied in the backward.
 Per chunk of rows: logits = hidden @ W^T (the matmul lm_head runs, fp16), one pass of
-`ce_stats_kernel` (lse, loss, entropy, argmax: what the loss and TRL / Soup's metrics need), one
-pass of `ce_backward_kernel` writing softmax - onehot over the chunk's logits in place, and one
+the statistics pass of `ce_kernel` (lse, loss, entropy, argmax: what the loss and TRL / Soup's
+metrics need), one gradient pass writing softmax - onehot over the chunk's logits in place, and one
 matmul into d hidden. Only one chunk of logits exists at a time.
 
 The fp16 gradient of the logits is written as (softmax - onehot) * 1024 (a power of two, so the
@@ -22,22 +22,21 @@ onehot), about 80 times, to fp16, so this is at least as precise.
 
 import torch
 
-from .kernels import CE_BLOCK, ce_backward_kernel, ce_stats
+from .kernels import ce_grad, ce_stats
 
 CHUNK_ROWS = 256  # 74 MiB of fp16 logits per chunk
 GRAD_SCALE = 1024.0
 
 
 def _chunks(hidden, weight, targets, lse, losses, entropy, argmax, unit, grad_hidden):
-    rows, vocab = hidden.shape[0], weight.shape[0]
+    rows = hidden.shape[0]
     for start in range(0, rows, CHUNK_ROWS):
         end = min(start + CHUNK_ROWS, rows)
         part = slice(start, end)
         logits = torch.nn.functional.linear(hidden[part], weight)
         ce_stats(logits, targets[part], True,
                  out=(lse[part], losses[part], entropy[part], argmax[part]))
-        ce_backward_kernel[(end - start,)](logits, targets[part], lse[part], unit, logits, vocab,
-                                           BLOCK=CE_BLOCK, num_warps=8)  # 1024 (p - onehot)
+        ce_grad(logits, targets[part], lse[part], unit, logits)  # 1024 (p - onehot), in place
         torch.mm(logits, weight, out=grad_hidden[part])
 
 
