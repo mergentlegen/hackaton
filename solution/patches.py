@@ -100,7 +100,7 @@ def patch_qwen2_attention():
                                        config.num_key_value_heads)
         attn = torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling,
-            is_causal=False)
+            is_causal=attention_mask is None)
         return self.o_proj(pack_rows(attn, b_idx, t_idx)), None
 
     modeling_qwen2.Qwen2Attention.forward = forward

@@ -115,8 +115,18 @@ def patch_causal_lm_packed():
         if position_ids is None:
             position_ids = torch.arange(seq, device=device).unsqueeze(0)
         cos, sin = model.rotary_emb(hidden, position_ids)
-        causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
-        mask4 = causal[None, None] & real[:, None, None, :]  # (B, 1, T, T) like transformers' mask
+        # With padding on the right, a real query never looks at a padding key (those lie in its
+        # future), so causal attention needs no mask at all, and the kernel then skips the whole
+        # upper triangle instead of computing the full (T, T) square under a mask. Padding query
+        # rows differ from transformers' mask, but they are dropped on the way out and get zero
+        # gradient. Any other padding layout keeps transformers' (B, 1, T, T) mask.
+        lengths = real.sum(dim=1)
+        right_padded = torch.equal(real, torch.arange(seq, device=device)[None, :] < lengths[:, None])
+        if right_padded:
+            mask4 = None
+        else:
+            causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
+            mask4 = causal[None, None] & real[:, None, None, :]
         packed = (b_idx, t_idx, batch, seq)
         for layer in model.layers[: config.num_hidden_layers]:
             hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
