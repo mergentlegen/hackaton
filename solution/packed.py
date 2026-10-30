@@ -20,6 +20,7 @@ attention implementation, ...) goes through the original forward.
 import torch
 
 from .kernels import fused_cross_entropy
+from .packed_logits import PackedLogits
 
 
 def _autocast_fp16():
@@ -143,8 +144,7 @@ def patch_causal_lm_packed():
             denom = torch.as_tensor(items, device=device, dtype=torch.float32)
         loss = fused_cross_entropy(logits, targets, denom)
 
-        padded = torch.zeros(batch * seq, logits.shape[-1], dtype=logits.dtype, device=device)
-        padded.index_copy_(0, rows, logits.detach())
-        return CausalLMOutputWithPast(loss=loss, logits=padded.view(batch, seq, -1))
+        return CausalLMOutputWithPast(loss=loss, logits=PackedLogits(logits.detach(), rows, batch,
+                                                                       seq))
 
     modeling_qwen2.Qwen2ForCausalLM.forward = forward

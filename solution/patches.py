@@ -5,6 +5,7 @@ import torch
 from .kernels import fused_cross_entropy, silu_mul
 from .attention import pack_rows, qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
+from .packed_logits import PackedLogits
 from .rmsnorm import rms_norm
 
 
@@ -136,6 +137,8 @@ def patch_logit_metrics():
         original = trl_utils.entropy_from_logits
 
         def entropy(logits, chunk_size=128):
+            if isinstance(logits, PackedLogits):
+                return entropy_from_logits(logits, chunk_size)
             if not isinstance(logits, torch.Tensor) or not logits.is_cuda:
                 return original(logits, chunk_size)
             return entropy_from_logits(logits, chunk_size)
@@ -150,6 +153,9 @@ def patch_logit_metrics():
     original_rows = rewind_hf.row_losses
 
     def row_losses(logits, labels):
+        if isinstance(logits, PackedLogits):
+            with torch.no_grad():
+                return row_cross_entropy(logits, labels)
         if not isinstance(logits, torch.Tensor) or not logits.is_cuda or logits.dim() != 3:
             return original_rows(logits, labels)
         with torch.no_grad():
