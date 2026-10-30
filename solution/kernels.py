@@ -14,7 +14,7 @@ import triton.language as tl
 
 ACT_BLOCK = 1024
 CE_BLOCK = 4096
-NEG = -1.0e30  # a finite "minus infinity": exp(NEG - x) is 0 and NEG - NEG never gives nan
+NEG = tl.constexpr(-1.0e30)  # a finite "minus infinity": exp(NEG - x) is 0 and NEG - NEG never gives nan
 
 
 # --------------------------------------------------------------------------------------------
