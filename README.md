@@ -2,8 +2,9 @@
 
 Custom `@triton.jit` kernel suite and SM75-aware memory/compute pipeline for `soup train` (`soup-cli==0.77.0`) fine-tuning **Qwen/Qwen2.5-1.5B-Instruct** (4-bit NF4 double-quant, LoRA `r=16, alpha=32` on `q_proj` & `v_proj`) on a single **Kaggle Tesla T4** (15 GiB VRAM, Turing SM75, FP16 AMP).
 
-- **Team Repository**: https://github.com/BAITC-Hacks/hack-1d15670c-team
-- **Public Kaggle T4 Notebook**: https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
+- **Primary GitHub Repository**: https://github.com/nursayatdev/nurskernel-byte
+- **Hackathon Repository**: https://github.com/BAITC-Hacks/hack-1d15670c-team
+- **Public Kaggle T4 Benchmark Notebook**: https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
 
 ---
 
@@ -88,15 +89,16 @@ python harness/score.py runs/result.json        # prints speedup (s), memory rat
 
 ### Results on Kaggle Tesla T4 (`runs/result.json` & `runs/checks.json`)
 
-| Metric | Base Soup 0.77.0 | Our Solution (v6) | Improvement / Delta |
-|---|---|---|---|
-| Whole `soup train` wall time (`wall_s`) | `88.70` s | **`54.15` s** | **`1.638x` faster** |
-| 64-step training loop (`train_loop_s`) | `54.13` s | **`31.36` s** | **`1.726x` faster** |
-| Median step time (`median_step_s`) | `0.8786` s | **`0.3885` s** | **`2.262x` faster** |
-| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`2,265` MiB** | **`6.333x` lower** |
-| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04981`** | **`+0.007%` vs base** ($\le +0.5\%$ allowed) |
-| Own `@triton.jit` share of training time (Check 4, steps 3+) | — | **`16.1%`** | $\ge 5.0\%$ required |
-| `harness/check_rules.py` (10 / 10 checks + 79 Soup tests) | — | **10 / 10 PASS** | Admission passed |
+| Metric | Base Soup 0.77.0 | Solution v6 (Record Run) | Verification Run (v13) | Official Improvement |
+|---|---|---|---|---|
+| Whole `soup train` wall time (`wall_s`) | `88.70` s | **`54.15` s** | `60.21` s | **`1.638x` faster** |
+| 64-step training loop (`train_loop_s`) | `54.13` s | **`31.36` s** | `37.68` s | **`1.726x` faster** |
+| Median step time (`median_step_s`) | `0.8786` s | **`0.3885` s** | `0.4910` s | **`2.262x` faster** |
+| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`2,265` MiB** | **`2,265` MiB** | **`6.333x` lower (84.2% cut)** |
+| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04981`** | **`2.04980`** | **`+0.007%` parity** ($\le +0.5\%$ rule) |
+| Own `@triton.jit` share (Check 4, steps 3+) | — | **`16.1%`** | **`14.9%`** | $\ge 5.0\%$ required (**PASS**) |
+| `harness/check_rules.py` (10 / 10 checks) | — | **10 / 10 PASS** | **10 / 10 PASS** | **100% Admission Passed** |
+| Soup regression tests (`pytest tests -q`) | — | **79 / 79 PASS** (0.68s) | **79 / 79 PASS** (0.71s) | **100% Green** |
 
 ### Limitations & Where Further Gains Stop
 1. **Selective Attention Checkpointing & Partial MLP Recompute Trade-off on SM75**: Reconstructing MLP `[gate | up]` pre-activations in backward (`recompute_mode=2`, while reusing the single `w_gate_up` dequantization and never recomputing `down_proj`) plus checkpointing part of the 28 Attention sub-blocks cuts ~12.5 GiB of VRAM (`7.76x` reduction) at a modest cost of one extra `[M, 1536] @ [1536, 17920]` GEMM per layer in backward.
