@@ -91,6 +91,26 @@ def main():
                     if shown >= 40:
                         break
                 gaps(prof)
+                # LoRA (rank 16): every op with a 16-wide operand, and the dropout ops
+                lora = sum(e.self_device_time_total for e in rows
+                           if any(16 in sh for sh in e.input_shapes if isinstance(sh, list))
+                           or "dropout" in e.key)
+                lora_n = sum(e.count for e in rows
+                             if any(16 in sh for sh in e.input_shapes if isinstance(sh, list))
+                             or "dropout" in e.key)
+                kernels = sum(e.count for e in prof.key_averages()
+                              if e.device_type == torch.autograd.DeviceType.CUDA)
+                n = LAST - FIRST + 1
+                print(f"OPPROF LoRA-shaped ops {lora / 1e3 / n:.1f} ms/step in {lora_n // n} ops; "
+                      f"{kernels // n} GPU kernels/step")
+                try:
+                    from solution.offload import OFFLOADER
+                    pinned = sum(c.numel() for c in OFFLOADER.chunks)
+                    print(f"OPPROF pinned host memory {pinned / 2**20:.0f} MiB in "
+                          f"{len(OFFLOADER.chunks)} chunks; last step offloaded "
+                          f"{sum(i.nbytes for i in OFFLOADER.items) / 2**20:.0f} MiB")
+                except ImportError:
+                    pass
 
     original_init = transformers.Trainer.__init__
 
