@@ -14,9 +14,11 @@ import triton.language as tl
 from .offload import OFFLOADER
 
 
-@triton.jit(do_not_specialize=["rows", "mode"])
-def rmsnorm_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, dy_ptr, dx_ptr, rows, hidden, eps, mode,
-                   BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["rows", "hidden", "mode", "_i3", "_i4"])
+def rmsnorm_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, dy_ptr, dx_ptr, _p6, _p7, _p8, _p9, rows, hidden,
+                   mode, _i3, _i4, eps, BLOCK: tl.constexpr, _c1: tl.constexpr,
+                   _c2: tl.constexpr, _c3: tl.constexpr):
+    # (the argument layout shared by all our kernels: see kernels.py)
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     col = offs < hidden
@@ -55,8 +57,9 @@ class RMSNorm(torch.autograd.Function):
         rstd = torch.empty(rows, dtype=torch.float32, device=x.device)
         # dy / dx arguments are unused in the forward branch; same dtypes as in the backward
         # call so that both directions are one compiled kernel
-        rmsnorm_kernel[(rows,)](x2, weight, out, rstd, out, x2, rows, hidden, eps, 0,
-                                BLOCK=triton.next_power_of_2(hidden), num_warps=8)
+        rmsnorm_kernel[(rows,)](x2, weight, out, rstd, out, x2, *[x2] * 4, rows, hidden, 0, 0, 0,
+                                eps, BLOCK=triton.next_power_of_2(hidden), _c1=0, _c2=0, _c3=0,
+                                num_warps=8)
         if offload:  # the fp32 input goes to pinned host memory (offload.py)
             ctx.item = OFFLOADER.save(x2)
             ctx.save_for_backward(weight, rstd)
@@ -74,8 +77,9 @@ class RMSNorm(torch.autograd.Function):
         rows, hidden = x2.shape
         dy2 = dy.reshape(rows, hidden).contiguous()
         dx = torch.empty_like(x2)
-        rmsnorm_kernel[(rows,)](x2, weight, dy2, rstd, dy2, dx, rows, hidden, 0.0, 1,
-                                BLOCK=triton.next_power_of_2(hidden), num_warps=8)
+        rmsnorm_kernel[(rows,)](x2, weight, dy2, rstd, dy2, dx, *[dx] * 4, rows, hidden, 1, 0, 0,
+                                0.0, BLOCK=triton.next_power_of_2(hidden), _c1=0, _c2=0, _c3=0,
+                                num_warps=8)
         dweight = None
         if ctx.needs_input_grad[1]:  # not the case in the task: the norm weights are frozen
             dweight = (dy2.float() * (x2.float() * rstd[:, None])).sum(dim=0).to(weight.dtype)

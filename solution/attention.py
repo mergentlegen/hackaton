@@ -135,7 +135,7 @@ def _qkv_backward(dq_ptr, dk_ptr, dv_ptr, cos_ptr, sin_ptr, b_ptr, t_ptr, dqi_pt
 
 @triton.jit(do_not_specialize=["seq", "scb", "sct", "layout", "mode"])
 def qkv_kernel(x0, x1, x2, cos_ptr, sin_ptr, b_ptr, t_ptr, y0, y1, y2, seq, scb, sct, layout, mode,
-               HEADS: tl.constexpr, KV: tl.constexpr, REP: tl.constexpr, HALF: tl.constexpr):
+               _f, HEADS: tl.constexpr, KV: tl.constexpr, REP: tl.constexpr, HALF: tl.constexpr):
     """mode 0: forward (x = q, k, v projections, y = rotated heads); mode 1: backward (x = their
     gradients, y = the projections' gradients). One compiled kernel for both."""
     if mode == 0:
@@ -166,7 +166,7 @@ class QKVRotate(torch.autograd.Function):
             ko, vo = torch.empty_like(qo), torch.empty_like(qo)
         qkv_kernel[(tokens, heads + 2 * kv_heads)](
             q, k, v, cos, sin, b_idx, t_idx, qo, ko, vo, seq, scb, cos.stride(1), int(padded), 0,
-            HEADS=heads, KV=kv_heads, REP=rep, HALF=half, num_warps=2)
+            0.0, HEADS=heads, KV=kv_heads, REP=rep, HALF=half, num_warps=2)
         ctx.save_for_backward(cos, sin, b_idx, t_idx)
         ctx.meta = (seq, scb, heads, kv_heads, rep, half, q.dtype, int(padded))
         return qo, ko, vo
@@ -183,7 +183,7 @@ class QKVRotate(torch.autograd.Function):
         dv_in = torch.empty_like(dk_in)
         qkv_kernel[(tokens, heads + 2 * kv_heads)](
             dq, dk, dv, cos, sin, b_idx, t_idx, dq_in, dk_in, dv_in, seq, scb, cos.stride(1),
-            layout, 1, HEADS=heads, KV=kv_heads, REP=rep, HALF=half, num_warps=2)
+            layout, 1, 0.0, HEADS=heads, KV=kv_heads, REP=rep, HALF=half, num_warps=2)
         return dq_in, dk_in, dv_in, None, None, None, None, None, None, None, None, None
 
 

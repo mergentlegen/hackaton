@@ -21,6 +21,11 @@ from .offload import OFFLOADER
 
 ACT_BLOCK = 1024
 CE_BLOCK = 4096
+# Every @triton.jit kernel in solution/ has the same argument layout: 10 pointers, 5 integers,
+# 1 float, 4 constexprs (unused slots are named _p*, _i*, _f, _c* and get dummies). Triton builds
+# and compiles a C launcher for each distinct layout (gcc, ~0.23 s on Kaggle's CPU, on the cold
+# cache of every measured run: tools/compile_overhead.py); with one layout it is built once
+# instead of five times. The pointers' dtypes and the constexprs' values do not matter for it.
 NEG = tl.constexpr(-1.0e30)  # a finite "minus infinity": exp(NEG - x) is 0 and NEG - NEG never gives nan
 
 
@@ -31,8 +36,10 @@ NEG = tl.constexpr(-1.0e30)  # a finite "minus infinity": exp(NEG - x) is 0 and 
 # mode 0 (forward):  p0 = gate, p1 = up, p2 = out
 # mode 1 (backward): p0 = d_out, p1 = gate, p2 = up, p3 = d_gate, p4 = d_up
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["n_elements", "mode"])
-def silu_mul_kernel(p0, p1, p2, p3, p4, n_elements, mode, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["n_elements", "mode", "_i2", "_i3", "_i4"])
+def silu_mul_kernel(p0, p1, p2, p3, p4, _p5, _p6, _p7, _p8, _p9, n_elements, mode, _i2, _i3, _i4,
+                    _f, BLOCK: tl.constexpr, _c1: tl.constexpr, _c2: tl.constexpr,
+                    _c3: tl.constexpr):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
     if mode == 0:
@@ -60,8 +67,9 @@ class SiluMul(torch.autograd.Function):
         gate, up = gate.contiguous(), up.contiguous()
         out = torch.empty_like(gate)
         n = gate.numel()
-        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](gate, up, out, out, out, n, 0,
-                                                      BLOCK=ACT_BLOCK)
+        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](gate, up, out, out, out, *[out] * 5, n, 0,
+                                                      0, 0, 0, 0.0, BLOCK=ACT_BLOCK, _c1=0,
+                                                      _c2=0, _c3=0)
         if offload:
             ctx.item = OFFLOADER.save(gate, up)
         else:
@@ -77,8 +85,9 @@ class SiluMul(torch.autograd.Function):
         dout = dout.contiguous()
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
         n = gate.numel()
-        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](dout, gate, up, dgate, dup, n, 1,
-                                                      BLOCK=ACT_BLOCK)
+        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](dout, gate, up, dgate, dup, *[dup] * 5, n,
+                                                      1, 0, 0, 0, 0.0, BLOCK=ACT_BLOCK, _c1=0,
+                                                      _c2=0, _c3=0)
         return dgate, dup, None
 
 
@@ -155,9 +164,10 @@ def _ce_backward(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, vocab, BL
 # One compiled kernel for both passes (each compile costs 0.3-0.6 s of the measured run): mode
 # 0-3 is the statistics pass with `want` = mode, mode 4 the gradient pass. Arguments one pass does
 # not use get tensors of the same dtypes, so both calls share the compiled kernel.
-@triton.jit(do_not_specialize=["mode"])
+@triton.jit(do_not_specialize=["vocab", "mode", "_i2", "_i3", "_i4"])
 def ce_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, scale_ptr,
-              grad_ptr, vocab, mode, BLOCK: tl.constexpr):
+              grad_ptr, _p8, _p9, vocab, mode, _i2, _i3, _i4, _f, BLOCK: tl.constexpr,
+              _c1: tl.constexpr, _c2: tl.constexpr, _c3: tl.constexpr):
     if mode == 4:
         _ce_backward(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, vocab, BLOCK)
     else:
@@ -169,8 +179,8 @@ def ce_grad(logits, targets, lse, scale, grad):
     """grad = scale * (softmax(logits) - onehot(targets)) per row, 0 for rows with target < 0;
     `grad` may be `logits` itself (each element is read before it is overwritten)."""
     rows, vocab = logits.shape
-    ce_kernel[(rows,)](logits, targets, lse, lse, lse, targets, scale, grad, vocab, 4,
-                       BLOCK=CE_BLOCK, num_warps=8)
+    ce_kernel[(rows,)](logits, targets, lse, lse, lse, targets, scale, grad, lse, lse, vocab, 4,
+                       0, 0, 0, 0.0, BLOCK=CE_BLOCK, _c1=0, _c2=0, _c3=0, num_warps=8)
 
 
 def ce_stats(logits, targets, want_entropy, out=None):
@@ -187,8 +197,9 @@ def ce_stats(logits, targets, want_entropy, out=None):
         argmax = targets  # not written
         want = int(want_entropy)
     scale = lse  # unused by the statistics pass
-    ce_kernel[(rows,)](logits, targets, lse, loss, entropy, argmax, scale, logits, vocab, want,
-                       BLOCK=CE_BLOCK, num_warps=8)
+    ce_kernel[(rows,)](logits, targets, lse, loss, entropy, argmax, scale, logits, lse, lse,
+                       vocab, want, 0, 0, 0, 0.0, BLOCK=CE_BLOCK, _c1=0, _c2=0, _c3=0,
+                       num_warps=8)
     return lse, loss, (entropy if want % 2 else None)
 
 

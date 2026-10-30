@@ -24,9 +24,11 @@ OUTPUTS = 2048  # weights decoded per program (tools/nf4_bench.py: 254 us for 89
 WARPS = 4  # T4, bitsandbytes 225 us; one lane per output was 288-520 us, a select chain slower)
 
 
-@triton.jit(do_not_specialize=["n_out"])
-def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, BLOCKSIZE: tl.constexpr,
-                       OUTPUTS: tl.constexpr):
+@triton.jit(do_not_specialize=["n_out", "_i1", "_i2", "_i3", "_i4"])
+def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, _p4, _p5, _p6, _p7, _p8, _p9,
+                       n_out, _i1, _i2, _i3, _i4, _f, BLOCKSIZE: tl.constexpr,
+                       OUTPUTS: tl.constexpr, _c2: tl.constexpr, _c3: tl.constexpr):
+    # (the argument layout shared by all our kernels: see kernels.py)
     # one lane per byte: its two weights are written by two stores at stride 2, which together
     # cover the same cache lines
     offs = tl.program_id(0).to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
@@ -66,8 +68,8 @@ def dequantize_nf4(packed, state):
     if code.device != packed.device or code.dtype != torch.float32:
         code = code.to(device=packed.device, dtype=torch.float32)
     nf4_dequant_kernel[(triton.cdiv(n_out, OUTPUTS),)](
-        packed, state.absmax, code, out, n_out, BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS,
-        num_warps=WARPS)
+        packed, state.absmax, code, out, *[out] * 6, n_out, 0, 0, 0, 0, 0.0,
+        BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS, _c2=0, _c3=0, num_warps=WARPS)
     return out
 
 
