@@ -3,6 +3,8 @@
 import torch
 
 from .kernels import fused_cross_entropy, silu_mul
+from .logit_stats import entropy_from_logits, row_cross_entropy
+from .rmsnorm import rms_norm
 
 
 def _is_4bit_linear(module):
@@ -65,3 +67,53 @@ def patch_causal_lm_loss():
     for key, value in list(loss_utils.LOSS_MAPPING.items()):
         if value is original:
             loss_utils.LOSS_MAPPING[key] = fused_loss
+
+
+def patch_qwen2_rmsnorm():
+    """Qwen2RMSNorm as one Triton pass each way (the stream is fp32 in Soup's 4-bit setup)."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2RMSNorm.forward
+
+    def forward(self, hidden_states):
+        weight = self.weight
+        if (hidden_states.is_cuda and hidden_states.dtype == torch.float32
+                and weight.dtype == torch.float32 and weight.is_cuda):
+            return rms_norm(hidden_states, weight, self.variance_epsilon)
+        return original(self, hidden_states)
+
+    modeling_qwen2.Qwen2RMSNorm.forward = forward
+
+
+def patch_logit_metrics():
+    """TRL's per-token entropy and Soup's per-row loss are read from the fp16 logits; run them as
+    single passes over the logits (same quantities, see logit_stats.py)."""
+    try:
+        from trl.trainer import sft_trainer
+        from trl.trainer import utils as trl_utils
+    except ImportError:
+        pass
+    else:
+        original = trl_utils.entropy_from_logits
+
+        def entropy(logits, chunk_size=128):
+            if not isinstance(logits, torch.Tensor) or not logits.is_cuda:
+                return original(logits, chunk_size)
+            return entropy_from_logits(logits, chunk_size)
+
+        trl_utils.entropy_from_logits = entropy
+        if hasattr(sft_trainer, "entropy_from_logits"):
+            sft_trainer.entropy_from_logits = entropy
+    try:
+        from soup_cli.trainer import rewind_hf
+    except ImportError:
+        return
+    original_rows = rewind_hf.row_losses
+
+    def row_losses(logits, labels):
+        if not isinstance(logits, torch.Tensor) or not logits.is_cuda or logits.dim() != 3:
+            return original_rows(logits, labels)
+        with torch.no_grad():
+            return row_cross_entropy(logits, labels)
+
+    rewind_hf.row_losses = row_losses
