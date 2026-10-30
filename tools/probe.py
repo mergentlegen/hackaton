@@ -9,6 +9,7 @@ keeps for the backward, and the peak of each step.
 
 import argparse
 import collections
+import re
 import sys
 
 sys.modules["unsloth"] = None
@@ -22,6 +23,10 @@ STOP_AFTER = 3
 WATCH_LAYERS = (0, 14)
 STATE = {"step": 0, "base": 0.0}
 SEEN = set()
+STACK = []
+SAVED = collections.defaultdict(float)
+PARAM_PTRS = set()
+SEEN_PTR = set()
 
 
 def say(*parts):
@@ -42,6 +47,37 @@ def mib():
 
 def recording():
     return STATE["step"] == 2 and torch.is_grad_enabled()
+
+
+def label():
+    return STACK[-1] if STACK else "functional"
+
+
+def pack(tensor):
+    try:
+        storage = tensor.untyped_storage()
+        ptr = storage.data_ptr()
+        if ptr not in PARAM_PTRS and ptr not in SEEN_PTR:
+            SEEN_PTR.add(ptr)
+            SAVED[(label(), str(tensor.dtype)[6:], tuple(tensor.shape))] += storage.nbytes() / 2**20
+    except Exception:  # noqa: BLE001 - analysis only
+        pass
+    return tensor
+
+
+def unpack(tensor):
+    return tensor
+
+
+def report_saved():
+    by_label = collections.defaultdict(float)
+    for (name, _dtype, _shape), size in SAVED.items():
+        by_label[name] += size
+    say(f"saved total_MiB={sum(by_label.values()):.0f}")
+    for name, size in sorted(by_label.items(), key=lambda kv: -kv[1])[:14]:
+        say(f"saved by module {name}: {size:.0f} MiB")
+    for (name, dtype, shape), size in sorted(SAVED.items(), key=lambda kv: -kv[1])[:30]:
+        say(f"saved {size:7.1f} MiB  {dtype:8s} {shape}  <- {name}")
 
 
 def wrap_model_memory():
@@ -70,7 +106,15 @@ def wrap_model_memory():
         watch = recording()
         before = mib()
         STATE["lm_start"] = before
-        out = original_lm(self, *args, **kwargs)
+        if watch:
+            STACK.clear()
+            SEEN_PTR.clear()
+            SAVED.clear()
+            with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+                out = original_lm(self, *args, **kwargs)
+            report_saved()
+        else:
+            out = original_lm(self, *args, **kwargs)
         if watch:
             say(f"causal_lm total_MiB={mib() - before:.1f} logits={desc(out.logits)} loss={desc(out.loss)}")
         return out
@@ -100,6 +144,15 @@ def register_hooks(model):
             module.register_forward_hook(make_hook(name))
         elif name.endswith(("embed_tokens", "lm_head", "model.norm")):
             module.register_forward_hook(make_hook(name))
+
+
+def register_stack_hooks(model):
+    for name, module in model.named_modules():
+        short = re.sub(r"layers\.\d+", "layers.*", name).replace("base_model.model.", "")
+        module.register_forward_pre_hook(lambda mod, args, n=short: STACK.append(n))
+        module.register_forward_hook(lambda mod, args, out: STACK.pop() if STACK else None)
+    for param in list(model.parameters()) + list(model.buffers()):
+        PARAM_PTRS.add(param.untyped_storage().data_ptr())
 
 
 def report_parameters(model):
@@ -148,6 +201,7 @@ def main():
         say("trainer", type(self).__name__, "model", type(self.model).__name__)
         report_parameters(self.model)
         register_hooks(self.model)
+        register_stack_hooks(self.model)
 
     transformers.Trainer.__init__ = init
     from soup_cli.cli import run
