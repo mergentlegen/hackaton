@@ -31,6 +31,7 @@ def main():
         labels = ids.clone()
         labels[mask == 0] = -100
         labels[:, :8] = -100
+        labels[:, 1:][mask[:, :-1] == 0] = -100  # no target predicted from a padding position
         model.zero_grad()
         with torch.autocast("cuda", dtype=torch.float16, enabled=not fp32):
             out = model(input_ids=ids, attention_mask=mask, labels=labels)

@@ -98,6 +98,13 @@ def patch_causal_lm_packed():
             and model.norm.weight.dtype == torch.float32
             and not kwargs.get("output_attentions") and not kwargs.get("output_hidden_states")
             and "shift_labels" not in kwargs and "packed" not in kwargs)
+        if eligible:
+            real = attention_mask.to(torch.bool)
+            shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
+            # the loss must only have terms at real positions, which is what the packed step
+            # computes (with left padding, the padding position before the first token can carry
+            # a label; with right padding, as in Soup, it never does)
+            eligible = shifted.shape == real.shape and not bool(((shifted != -100) & ~real).any())
         if not eligible:
             return original(self, input_ids=input_ids, attention_mask=attention_mask,
                             position_ids=position_ids, past_key_values=past_key_values,
@@ -107,7 +114,6 @@ def patch_causal_lm_packed():
         _fp16_embeddings(model, self.lm_head)
         batch, seq = input_ids.shape
         device = input_ids.device
-        real = attention_mask.to(torch.bool)
         rows = torch.nonzero(real.reshape(-1), as_tuple=True)[0]  # flat (b * seq + t) of real tokens
         b_idx = (rows // seq).to(torch.int32)
         t_idx = (rows % seq).to(torch.int32)
@@ -135,7 +141,6 @@ def patch_causal_lm_packed():
         hidden = model.norm(hidden)
         logits = self.lm_head(hidden)  # (N, vocab), fp16 under autocast
 
-        shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
         targets = shifted.reshape(-1)[rows]
         items = kwargs.get("num_items_in_batch")
         if items is None:
