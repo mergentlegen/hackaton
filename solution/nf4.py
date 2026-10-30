@@ -13,29 +13,30 @@ the same (solution/test_nf4.py). The scales must be plain fp32 (not double-quant
 step decodes the 8-bit scales once for good (packed.py `_flatten_quant_states`), anything else
 goes to bitsandbytes.
 
-One program decodes `BYTES` bytes (2 * BYTES weights) with coalesced loads and one interleaved
-store; the 16-entry table stays in L1.
+One lane per output weight, so the fp16 stores are fully coalesced; the 16-entry table and the
+scales are read through the cache.
 """
 
 import torch
 import triton
 import triton.language as tl
 
-BYTES = 1024
+OUTPUTS = 2048  # weights decoded per program
+WARPS = 4
 
 
-@triton.jit(do_not_specialize=["n_bytes"])
-def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_bytes,
-                       HALF_BLOCK: tl.constexpr, BYTES: tl.constexpr):
-    offs = tl.program_id(0).to(tl.int64) * BYTES + tl.arange(0, BYTES)
-    mask = offs < n_bytes
-    byte = tl.load(packed_ptr + offs, mask=mask, other=0).to(tl.int32)
-    scale = tl.load(absmax_ptr + offs // HALF_BLOCK, mask=mask, other=0.0)
-    first = tl.load(code_ptr + (byte >> 4)) * scale
-    second = tl.load(code_ptr + (byte & 15)) * scale
-    values = tl.interleave(first, second).to(out_ptr.dtype.element_ty)
-    out_offs = tl.interleave(2 * offs, 2 * offs + 1)
-    tl.store(out_ptr + out_offs, values, mask=out_offs < 2 * n_bytes)
+@triton.jit(do_not_specialize=["n_out"])
+def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, BLOCKSIZE: tl.constexpr,
+                       OUTPUTS: tl.constexpr):
+    # one output weight per lane: consecutive lanes store consecutive fp16 values (coalesced);
+    # the two lanes of a byte read the same byte, served by the cache
+    offs = tl.program_id(0).to(tl.int64) * OUTPUTS + tl.arange(0, OUTPUTS)
+    mask = offs < n_out
+    byte = tl.load(packed_ptr + offs // 2, mask=mask, other=0).to(tl.int32)
+    nibble = tl.where(offs % 2 == 0, byte >> 4, byte & 15)
+    scale = tl.load(absmax_ptr + offs // BLOCKSIZE, mask=mask, other=0.0)
+    value = tl.load(code_ptr + nibble) * scale
+    tl.store(out_ptr + offs, value.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def can_dequantize(packed, state):
@@ -53,13 +54,13 @@ def can_dequantize(packed, state):
 def dequantize_nf4(packed, state):
     """The weight `state.shape` in `state.dtype` from its packed NF4 bytes."""
     out = torch.empty(state.shape, dtype=state.dtype, device=packed.device)
-    n_bytes = packed.numel()
+    n_out = out.numel()
     code = state.code
     if code.device != packed.device or code.dtype != torch.float32:
         code = code.to(device=packed.device, dtype=torch.float32)
-    nf4_dequant_kernel[(triton.cdiv(n_bytes, BYTES),)](
-        packed, state.absmax, code, out, n_bytes, HALF_BLOCK=state.blocksize // 2, BYTES=BYTES,
-        num_warps=4)
+    nf4_dequant_kernel[(triton.cdiv(n_out, OUTPUTS),)](
+        packed, state.absmax, code, out, n_out, BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS,
+        num_warps=WARPS)
     return out
 
 
