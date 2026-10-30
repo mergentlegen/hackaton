@@ -1,0 +1,93 @@
+"""Padding-free training step for Qwen2.
+
+Soup trains on batches of 4 sequences padded to the longest one. On this data 43% of the
+positions are padding (mean length 207 tokens, longest of four ~360), and every layer computes
+them: projections, LoRA, norms, MLP, lm_head, loss, and the memory for all of it. The task
+explicitly allows removing padding inside a batch (never mixing rows across batches).
+
+`Qwen2ForCausalLM.forward` is replaced for the training step: the N real tokens are gathered
+into an (N, hidden) matrix and go through the unchanged decoder layers (they are shape agnostic
+except attention, which gets the token -> (row, position) map and keeps the padded layout only for
+scaled_dot_product_attention, see attention.py). The loss is the same cross-entropy on the same
+rows (padding rows had label -100). The logits TRL and Soup read for their metrics are handed
+over in the padded (B, T, vocab) layout, detached, with zeros at the padding positions, which
+those metrics ignore (attention mask / -100 labels).
+
+Anything that is not that exact training step (evaluation, a cache, labels missing, another
+attention implementation, ...) goes through the original forward.
+"""
+
+import torch
+
+from .kernels import fused_cross_entropy
+
+
+def _autocast_fp16():
+    try:
+        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+    except (TypeError, RuntimeError):  # older torch without the device argument
+        return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+
+
+def patch_causal_lm_packed():
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2ForCausalLM.forward
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None,
+                past_key_values=None, inputs_embeds=None, labels=None, use_cache=None,
+                logits_to_keep=0, **kwargs):
+        model, config = self.model, self.config
+        eligible = (
+            self.training and torch.is_grad_enabled() and labels is not None
+            and input_ids is not None and inputs_embeds is None and past_key_values is None
+            and not use_cache and isinstance(attention_mask, torch.Tensor)
+            and attention_mask.dim() == 2 and isinstance(logits_to_keep, int)
+            and logits_to_keep == 0 and input_ids.is_cuda
+            and getattr(config, "_attn_implementation", None) == "sdpa"
+            and not getattr(model, "has_sliding_layers", False)
+            and config.attention_dropout == 0.0 and _autocast_fp16()
+            and model.norm.weight.dtype == torch.float32
+            and not kwargs.get("output_attentions") and not kwargs.get("output_hidden_states")
+            and "shift_labels" not in kwargs and "packed" not in kwargs)
+        if not eligible:
+            return original(self, input_ids=input_ids, attention_mask=attention_mask,
+                            position_ids=position_ids, past_key_values=past_key_values,
+                            inputs_embeds=inputs_embeds, labels=labels, use_cache=use_cache,
+                            logits_to_keep=logits_to_keep, **kwargs)
+
+        batch, seq = input_ids.shape
+        device = input_ids.device
+        real = attention_mask.to(torch.bool)
+        rows = torch.nonzero(real.reshape(-1), as_tuple=True)[0]  # flat (b * seq + t) of real tokens
+        b_idx = (rows // seq).to(torch.int32)
+        t_idx = (rows % seq).to(torch.int32)
+
+        hidden = model.embed_tokens(input_ids.reshape(-1)[rows]).to(torch.float32)
+        if position_ids is None:
+            position_ids = torch.arange(seq, device=device).unsqueeze(0)
+        cos, sin = model.rotary_emb(hidden, position_ids)
+        causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
+        mask4 = causal[None, None] & real[:, None, None, :]  # (B, 1, T, T) like transformers' mask
+        packed = (b_idx, t_idx, batch, seq)
+        for layer in model.layers[: config.num_hidden_layers]:
+            hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
+                           position_embeddings=(cos, sin), packed=packed)
+        hidden = model.norm(hidden)
+        logits = self.lm_head(hidden)  # (N, vocab), fp16 under autocast
+
+        shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
+        targets = shifted.reshape(-1)[rows]
+        items = kwargs.get("num_items_in_batch")
+        if items is None:
+            denom = (targets != -100).sum().to(torch.float32)
+        else:
+            denom = torch.as_tensor(items, device=device, dtype=torch.float32)
+        loss = fused_cross_entropy(logits, targets, denom)
+
+        padded = torch.zeros(batch * seq, logits.shape[-1], dtype=logits.dtype, device=device)
+        padded.index_copy_(0, rows, logits.detach())
+        return CausalLMOutputWithPast(loss=loss, logits=padded.view(batch, seq, -1))
+
+    modeling_qwen2.Qwen2ForCausalLM.forward = forward

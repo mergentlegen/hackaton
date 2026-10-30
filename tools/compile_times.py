@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch  # noqa: E402
 
-from solution.attention import qkv_rotate  # noqa: E402
+from solution.attention import pack_rows, qkv_rotate  # noqa: E402
 from solution.kernels import fused_cross_entropy, silu_mul  # noqa: E402
 from solution.logit_stats import entropy_from_logits, row_cross_entropy  # noqa: E402
 from solution.rmsnorm import rms_norm  # noqa: E402
@@ -66,15 +66,22 @@ def main():
     dy = torch.randn_like(y)
     timed("rmsnorm bwd", lambda: torch.autograd.grad(y, x, dy, retain_graph=True))
 
-    q = torch.randn(batch, seq, 1536, device=DEV, requires_grad=True)
-    k = torch.randn(batch, seq, 256, device=DEV, requires_grad=True)
-    v = torch.randn(batch, seq, 256, device=DEV, requires_grad=True)
-    cos = torch.randn(batch, seq, 128, device=DEV)
-    sin = torch.randn(batch, seq, 128, device=DEV)
-    timed("qkv_rotate fwd", lambda: qkv_rotate(q, k, v, cos, sin, 12, 2))
-    outs = qkv_rotate(q, k, v, cos, sin, 12, 2)
+    tokens = batch * seq
+    b_idx = (torch.arange(tokens, device=DEV) // seq).to(torch.int32)
+    t_idx = (torch.arange(tokens, device=DEV) % seq).to(torch.int32)
+    q = torch.randn(tokens, 1536, device=DEV, requires_grad=True)
+    k = torch.randn(tokens, 256, device=DEV, requires_grad=True)
+    v = torch.randn(tokens, 256, device=DEV, requires_grad=True)
+    cos = torch.randn(1, seq, 128, device=DEV)
+    sin = torch.randn(1, seq, 128, device=DEV)
+    timed("qkv_rotate fwd", lambda: qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, 12, 2))
+    outs = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, 12, 2)
     grads = [torch.randn_like(o) for o in outs]
     timed("qkv_rotate bwd", lambda: torch.autograd.grad(outs, (q, k, v), grads, retain_graph=True))
+    attn = torch.randn(batch, 12, seq, 128, device=DEV, dtype=torch.float16, requires_grad=True)
+    timed("pack_rows fwd", lambda: pack_rows(attn, b_idx, t_idx))
+    packed = pack_rows(attn, b_idx, t_idx)
+    timed("pack_rows bwd", lambda: torch.autograd.grad(packed, attn, torch.randn_like(packed), retain_graph=True))
     print(f"TOTAL first {TOTAL['first']:.2f}s, second {TOTAL['second']:.2f}s, "
           f"compile ~{TOTAL['first'] - TOTAL['second']:.2f}s")
 

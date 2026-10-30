@@ -3,7 +3,7 @@
 import torch
 
 from .kernels import fused_cross_entropy, silu_mul
-from .attention import qkv_rotate
+from .attention import pack_rows, qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .rmsnorm import rms_norm
 
@@ -87,27 +87,21 @@ def patch_qwen2_attention():
 
     def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
                 **kwargs):
-        cos, sin = position_embeddings
-        config = self.config
-        if (past_key_values is not None or attention_mask is None or attention_mask.dim() != 4
-                or getattr(config, "_attn_implementation", None) != "sdpa"
-                or self.sliding_window is not None
-                or (self.training and self.attention_dropout > 0.0)
-                or hidden_states.dtype != torch.float32 or cos.dtype != torch.float32
-                or not hidden_states.is_cuda or not _autocast_fp16()
-                or self.head_dim % 2 != 0
-                or config.num_attention_heads % config.num_key_value_heads != 0):
+        packed = kwargs.pop("packed", None)
+        if packed is None:  # not the packed training step (packed.py): the original code
             return original(self, hidden_states, position_embeddings, attention_mask,
                             past_key_values, **kwargs)
-        batch, seq = hidden_states.shape[:2]
+        b_idx, t_idx, batch, seq = packed
+        cos, sin = position_embeddings
+        config = self.config
         query, key, value = qkv_rotate(self.q_proj(hidden_states), self.k_proj(hidden_states),
-                                       self.v_proj(hidden_states), cos, sin,
-                                       config.num_attention_heads, config.num_key_value_heads)
+                                       self.v_proj(hidden_states), cos, sin, b_idx, t_idx, batch,
+                                       seq, config.num_attention_heads,
+                                       config.num_key_value_heads)
         attn = torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling,
             is_causal=False)
-        attn = attn.transpose(1, 2).reshape(batch, seq, -1)
-        return self.o_proj(attn), None
+        return self.o_proj(pack_rows(attn, b_idx, t_idx)), None
 
     modeling_qwen2.Qwen2Attention.forward = forward
 

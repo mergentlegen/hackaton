@@ -1,4 +1,4 @@
-"""The Q/K/V kernels against transformers' rotation, casts and repeat_kv."""
+"""The packed attention kernels against transformers' rotation, casts and repeat_kv."""
 
 import pytest
 import torch
@@ -12,6 +12,7 @@ def rotate_half(x):
 
 
 def reference(q, k, v, cos, sin, heads, kv_heads):
+    """transformers: transpose, apply_rotary_pos_emb, the autocast cast, repeat_kv."""
     batch, seq, _ = q.shape
     dim = cos.shape[-1]
     q4 = q.view(batch, seq, heads, dim).transpose(1, 2)
@@ -28,31 +29,66 @@ def reference(q, k, v, cos, sin, heads, kv_heads):
     return q_emb.half(), repeat_kv(k_emb).half(), repeat_kv(v4).half()
 
 
-@pytest.mark.parametrize("batch,seq", [(4, 334), (2, 37)])
-def test_qkv_rotate_matches_transformers(batch, seq):
+def token_maps(lengths, seq):
+    real = torch.zeros(len(lengths), seq, dtype=torch.bool, device="cuda")
+    for row, length in enumerate(lengths):
+        real[row, :length] = True
+    rows = torch.nonzero(real.reshape(-1), as_tuple=True)[0]
+    return rows, (rows // seq).to(torch.int32), (rows % seq).to(torch.int32)
+
+
+@pytest.mark.parametrize("lengths,seq", [([64, 37, 50, 12], 64), ([334, 200, 100, 7], 334)])
+def test_qkv_rotate_matches_transformers(lengths, seq):
     from solution.attention import qkv_rotate
 
     torch.manual_seed(0)
-    heads, kv_heads, dim = 12, 2, 128
-    q = torch.randn(batch, seq, heads * dim, device="cuda", requires_grad=True)
-    k = torch.randn(batch, seq, kv_heads * dim, device="cuda", requires_grad=True)
-    v = torch.randn(batch, seq, kv_heads * dim, device="cuda", requires_grad=True)
+    batch, heads, kv_heads, dim = len(lengths), 12, 2, 128
+    rows, b_idx, t_idx = token_maps(lengths, seq)
+    n = rows.numel()
+    q = torch.randn(n, heads * dim, device="cuda", requires_grad=True)
+    k = torch.randn(n, kv_heads * dim, device="cuda", requires_grad=True)
+    v = torch.randn(n, kv_heads * dim, device="cuda", requires_grad=True)
     inv_freq = 1.0 / (1000000.0 ** (torch.arange(0, dim, 2, device="cuda").float() / dim))
     freqs = torch.arange(seq, device="cuda").float()[:, None] * inv_freq[None]
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos()[None].expand(batch, seq, dim).contiguous()
-    sin = emb.sin()[None].expand(batch, seq, dim).contiguous()
+    cos, sin = emb.cos()[None], emb.sin()[None]  # (1, T, D) like transformers' rotary_emb
     grads = [torch.randn(batch, heads, seq, dim, device="cuda").half() for _ in range(3)]
 
-    ref = reference(q, k, v, cos, sin, heads, kv_heads)
+    def padded(x):
+        full = torch.zeros(batch * seq, x.shape[-1], device="cuda")
+        return full.index_copy(0, rows, x).view(batch, seq, -1)
+
+    ref = reference(padded(q), padded(k), padded(v), cos.expand(batch, seq, dim),
+                    sin.expand(batch, seq, dim), heads, kv_heads)
     torch.autograd.backward(ref, grads)
     ref_grads = [t.grad.clone() for t in (q, k, v)]
     for t in (q, k, v):
         t.grad = None
 
-    out = qkv_rotate(q, k, v, cos, sin, heads, kv_heads)
+    out = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, heads, kv_heads)
     torch.autograd.backward(out, grads)
     for mine, theirs in zip(out, ref):
         torch.testing.assert_close(mine.float(), theirs.float(), rtol=2e-3, atol=2e-3)
     for mine, theirs in zip((q.grad, k.grad, v.grad), ref_grads):
         torch.testing.assert_close(mine, theirs, rtol=2e-3, atol=2e-2)
+
+
+def test_pack_rows_matches_indexing():
+    from solution.attention import pack_rows
+
+    torch.manual_seed(0)
+    lengths, seq, heads, dim = [50, 20, 33], 64, 12, 128
+    rows, b_idx, t_idx = token_maps(lengths, seq)
+    attn = torch.randn(len(lengths), heads, seq, dim, device="cuda", dtype=torch.float16,
+                       requires_grad=True)
+    grad = torch.randn(rows.numel(), heads * dim, device="cuda", dtype=torch.float16)
+
+    ref = attn.permute(0, 2, 1, 3).reshape(-1, heads * dim)[rows]
+    ref.backward(grad)
+    ref_grad = attn.grad.clone()
+    attn.grad = None
+
+    out = pack_rows(attn, b_idx, t_idx)
+    out.backward(grad)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    torch.testing.assert_close(attn.grad, ref_grad, rtol=0, atol=0)

@@ -13,6 +13,7 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .packed import patch_causal_lm_packed
 from .patches import (patch_causal_lm_loss, patch_logit_metrics, patch_qwen2_attention,
                       patch_qwen2_mlp, patch_qwen2_rmsnorm)
 
@@ -21,5 +22,6 @@ def apply():
     patch_qwen2_mlp()
     patch_qwen2_attention()
     patch_causal_lm_loss()
+    patch_causal_lm_packed()
     patch_qwen2_rmsnorm()
     patch_logit_metrics()
