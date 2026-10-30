@@ -203,9 +203,47 @@ def main():
 
     original_init = transformers.Trainer.__init__
 
+    def phases(trainer):
+        """Peak of compute_loss (forward + metrics) and of the backward pass, per step."""
+        compute_loss = trainer.compute_loss
+        original_backward = torch.autograd.backward
+
+        def timed_loss(*a, **k):
+            torch.cuda.reset_peak_memory_stats()
+            start = mib()
+            out = compute_loss(*a, **k)
+            say(f"phase compute_loss step {STATE['step']}: start={start:.0f} end={mib():.0f} "
+                f"peak={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+            return out
+
+        def timed_backward(*a, **k):
+            torch.cuda.reset_peak_memory_stats()
+            start = mib()
+            out = original_backward(*a, **k)
+            say(f"phase backward step {STATE['step']}: start={start:.0f} end={mib():.0f} "
+                f"peak={torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+            return out
+
+        trainer.compute_loss = timed_loss
+        torch.autograd.backward = timed_backward
+        try:
+            from solution.packed_logits import PackedLogits
+        except ImportError:
+            return
+        dense = PackedLogits.dense
+
+        def traced_dense(self):
+            import traceback
+            say("PackedLogits.dense() called from:",
+                " | ".join(line.strip().replace("\n", " ") for line in traceback.format_stack()[-6:-1]))
+            return dense(self)
+
+        PackedLogits.dense = traced_dense
+
     def init(self, *init_args, **init_kwargs):
         original_init(self, *init_args, **init_kwargs)
         self.add_callback(Probe())
+        phases(self)
         say("trainer", type(self).__name__, "model", type(self.model).__name__)
         report_parameters(self.model)
         register_hooks(self.model)
