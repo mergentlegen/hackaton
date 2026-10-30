@@ -316,6 +316,33 @@ def test_packed_checkpointed_decoder_layer_lora_parity():
             assert cos > 0.999, f"Low grad cosine similarity on {name}: {cos}"
 
 
+def test_single_launch_pair_triple_nf4_dequant_and_dropout_lora():
+    """Verify 1-launch pair/triple NF4 dequantization matches individual dequantization bit-for-bit."""
+    import bitsandbytes as bnb
+    from solution.nf4_linear import (
+        _dequant_pair_to_workspace,
+        _dequant_triple_to_workspace,
+        dequantize_nf4_triton,
+    )
+
+    torch.manual_seed(99)
+    p1 = bnb.nn.Params4bit(torch.randn(384, 256, dtype=torch.float16), requires_grad=False, compress_statistics=True, quant_type="nf4").to("cuda")
+    p2 = bnb.nn.Params4bit(torch.randn(128, 256, dtype=torch.float16), requires_grad=False, compress_statistics=True, quant_type="nf4").to("cuda")
+    p3 = bnb.nn.Params4bit(torch.randn(128, 256, dtype=torch.float16), requires_grad=False, compress_statistics=True, quant_type="nf4").to("cuda")
+
+    w1 = dequantize_nf4_triton(p1.data, p1.quant_state, dtype=torch.float16).clone()
+    w2 = dequantize_nf4_triton(p2.data, p2.quant_state, dtype=torch.float16).clone()
+    w3 = dequantize_nf4_triton(p3.data, p3.quant_state, dtype=torch.float16).clone()
+
+    w12 = _dequant_pair_to_workspace(p1.data, p1.quant_state, p2.data, p2.quant_state, torch.float16).clone()
+    torch.testing.assert_close(w12, torch.cat([w1, w2], dim=0), rtol=0, atol=0)
+
+    w123 = _dequant_triple_to_workspace(
+        p1.data, p1.quant_state, p2.data, p2.quant_state, p3.data, p3.quant_state, torch.float16
+    ).clone()
+    torch.testing.assert_close(w123, torch.cat([w1, w2, w3], dim=0), rtol=0, atol=0)
+
+
 def test_sm75_shared_memory_and_rule_compliance():
     """Verify AST check passes with 0 lookalikes/banned imports and all compiled kernels fit well within SM75 64KB smem."""
     import sys

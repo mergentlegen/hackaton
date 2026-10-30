@@ -112,6 +112,61 @@ def rmsnorm_nograd_2d(
     return y_2d
 
 
+def rmsnorm_fwd_2d_with_r(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """2D RMSNorm forward returning (y_2d, r_fp32) for fused attention blocks."""
+    m, d = x_2d.shape
+    y_2d = torch.empty_like(x_2d)
+    r = torch.empty((m,), dtype=torch.float32, device=x_2d.device)
+    if m > 0:
+        block, warps = _norm_launch_cfg(d)
+        triton_rmsnorm_fwd[(m,)](
+            x_2d,
+            x_2d,
+            y_2d,
+            y_2d,
+            weight,
+            r,
+            x_2d.stride(0),
+            d,
+            eps,
+            0,
+            BLOCK_SIZE=block,
+            num_warps=warps,
+        )
+    return y_2d, r
+
+
+def rmsnorm_bwd_2d(
+    grad_2d: torch.Tensor,
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    r: torch.Tensor,
+) -> torch.Tensor:
+    """2D RMSNorm backward returning dx_2d for fused attention blocks."""
+    m, d = x_2d.shape
+    dx_2d = torch.empty_like(x_2d)
+    if m > 0:
+        block, warps = _norm_launch_cfg(d)
+        triton_rmsnorm_bwd[(m,)](
+            grad_2d,
+            grad_2d,
+            x_2d,
+            weight,
+            r,
+            dx_2d,
+            x_2d.stride(0),
+            d,
+            0,
+            BLOCK_SIZE=block,
+            num_warps=warps,
+        )
+    return dx_2d
+
+
 class TritonRMSNormFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):

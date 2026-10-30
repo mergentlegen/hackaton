@@ -11,9 +11,9 @@ from torch.nn import functional as F
 
 _TLS = threading.local()
 
-# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~1.8-1.9 GiB even on max-length batches
-_ATTN_UNCKPT_BUDGET_MIB = 180.0
-_ATTN_MIB_PER_TOKEN = 0.0195  # ~20 KB/token for uncheckpointed (RMSNorm + LoRA + 2-head KV Cutlass SDPA)
+# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~1.7-1.8 GiB while uncheckpointing more layers
+_ATTN_UNCKPT_BUDGET_MIB = 140.0
+_ATTN_MIB_PER_TOKEN = 0.0105  # ~10.5 KB/token with TritonFusedAttnQKVRoPEFunc (1-byte dropout masks + 2-head KV)
 
 
 @dataclass
@@ -326,6 +326,434 @@ def _apply_lora_adapters_2d(proj_mod, x: torch.Tensor, base_slice_2d: torch.Tens
     return res_2d
 
 
+def _extract_single_lora(proj_mod):
+    """Extract (wa, wb, scaling, drop_p, is_supported) for fused in-place LoRA execution."""
+    if not hasattr(proj_mod, "lora_A"):
+        return None, None, 0.0, 0.0, True
+    if proj_mod.disable_adapters or proj_mod.merged:
+        return None, None, 0.0, 0.0, False
+    active = [a for a in proj_mod.active_adapters if a in proj_mod.lora_A]
+    if len(active) == 0:
+        return None, None, 0.0, 0.0, True
+    if len(active) > 1:
+        return None, None, 0.0, 0.0, False
+    a = active[0]
+    if a in getattr(proj_mod, "lora_variant", {}):
+        return None, None, 0.0, 0.0, False
+    lora_A = proj_mod.lora_A[a]
+    lora_B = proj_mod.lora_B[a]
+    if lora_A.bias is not None or lora_B.bias is not None:
+        return None, None, 0.0, 0.0, False
+    dropout = proj_mod.lora_dropout[a]
+    drop_p = float(getattr(dropout, "p", 0.0)) if getattr(dropout, "training", False) else 0.0
+    scaling = float(proj_mod.scaling[a])
+    return lora_A.weight, lora_B.weight, scaling, drop_p, True
+
+
+def _lora_fwd_inplace(
+    normed_2d: torch.Tensor,
+    slice_2d: torch.Tensor,
+    wa: torch.Tensor | None,
+    wb: torch.Tensor | None,
+    scale: float,
+    drop_p: float,
+    comp_dtype: torch.dtype,
+):
+    if wa is None or wb is None:
+        return None, None
+    if drop_p > 0.0:
+        x_drop, mask = torch._VF._fused_dropout(normed_2d, 1.0 - drop_p)
+    else:
+        x_drop, mask = normed_2d, None
+    wa_c = wa if wa.dtype == comp_dtype else wa.to(comp_dtype)
+    wb_c = wb if wb.dtype == comp_dtype else wb.to(comp_dtype)
+    h = torch.matmul(x_drop, wa_c.t())
+    slice_2d.addmm_(h, wb_c.t(), beta=1.0, alpha=scale)
+    return h, mask
+
+
+def _lora_bwd_branch(
+    g_slice: torch.Tensor,
+    h: torch.Tensor,
+    mask: torch.Tensor,
+    wa: torch.Tensor,
+    wb: torch.Tensor,
+    scale: float,
+    drop_p: float,
+    has_branch: bool,
+    need_wa: bool,
+    need_wb: bool,
+    need_dx: bool,
+    normed_2d: torch.Tensor | None,
+    comp_dtype: torch.dtype,
+):
+    if not has_branch:
+        return None, None, None
+    grad_wa = None
+    grad_wb = None
+    dx_lora = None
+    if need_wb:
+        grad_wb = torch.matmul(g_slice.t(), h).to(wb.dtype).mul_(scale)
+    if need_wa or need_dx:
+        wb_c = wb if wb.dtype == comp_dtype else wb.to(comp_dtype)
+        dh = torch.matmul(g_slice, wb_c).mul_(scale)
+        if need_wa and normed_2d is not None:
+            x_drop = (
+                torch._masked_scale(normed_2d, mask, 1.0 / (1.0 - drop_p))
+                if drop_p > 0.0
+                else normed_2d
+            )
+            grad_wa = torch.matmul(dh.t(), x_drop).to(wa.dtype)
+            del x_drop
+        if need_dx:
+            wa_c = wa if wa.dtype == comp_dtype else wa.to(comp_dtype)
+            dx_drop = torch.matmul(dh, wa_c)
+            dx_lora = (
+                torch._masked_scale(dx_drop, mask, 1.0 / (1.0 - drop_p))
+                if drop_p > 0.0
+                else dx_drop
+            )
+    return grad_wa, grad_wb, dx_lora
+
+
+class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
+    """Fused Attention Front-End:
+    - RMSNorm written directly in compute_dtype (no fp32->fp16 cast copy).
+    - 1-launch triple NF4 dequantization + 1 QKV base GEMM into qkv_2d [M, dq+dk+dv].
+    - In-place Q/K/V LoRA via addmm_ on strided qkv_2d slices, saving only 1-byte dropout masks
+      and rank-r h tensors (normed_2d and dropped inputs are freed immediately!).
+    - Stride-native triton_qk_rope_kernel reading directly from strided qkv_2d in forward and
+      writing dq, dk directly into strided grad_qkv_2d in backward (zero SliceBackward0!).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        norm_w: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        wa_q: torch.Tensor | None,
+        wb_q: torch.Tensor | None,
+        wa_k: torch.Tensor | None,
+        wb_k: torch.Tensor | None,
+        wa_v: torch.Tensor | None,
+        wb_v: torch.Tensor | None,
+        norm_eps: float,
+        qkv_meta: tuple,
+        lora_cfg: tuple,
+        comp_dtype: torch.dtype,
+        head_dim: int,
+    ):
+        from .nf4_linear import _dequant_triple_to_workspace
+        from .rmsnorm import _norm_launch_cfg, triton_rmsnorm_fwd
+        from .rope import launch_qk_rope_bshd_strided
+
+        orig_shape = x.shape
+        b, s, d = orig_shape[0], orig_shape[1], orig_shape[2]
+        m = b * s
+        q_base, q_qs, k_base, k_qs, v_base, v_qs, dq, dk, dv, qkv_bias = qkv_meta
+        scale_q, drop_q, scale_k, drop_k, scale_v, drop_v = lora_cfg
+        h_q = dq // head_dim
+        h_k = dk // head_dim
+
+        x_2d = x.reshape(m, d).contiguous()
+        normed_2d = torch.empty((m, d), dtype=comp_dtype, device=x.device)
+        r = torch.empty((m,), dtype=torch.float32, device=x.device)
+        if m > 0:
+            block, warps = _norm_launch_cfg(d)
+            triton_rmsnorm_fwd[(m,)](
+                x_2d,
+                x_2d,
+                normed_2d,
+                normed_2d,
+                norm_w,
+                r,
+                x_2d.stride(0),
+                d,
+                norm_eps,
+                0,
+                BLOCK_SIZE=block,
+                num_warps=warps,
+            )
+
+        w_qkv = _dequant_triple_to_workspace(
+            q_base.weight.data,
+            q_qs,
+            k_base.weight.data,
+            k_qs,
+            v_base.weight.data,
+            v_qs,
+            comp_dtype,
+        )
+        b_comp = (
+            None
+            if qkv_bias is None
+            else (qkv_bias if qkv_bias.dtype == comp_dtype else qkv_bias.to(comp_dtype))
+        )
+        qkv_2d = F.linear(normed_2d, w_qkv, b_comp)
+
+        hq, mask_q = _lora_fwd_inplace(
+            normed_2d, qkv_2d[:, :dq], wa_q, wb_q, scale_q, drop_q, comp_dtype
+        )
+        hk, mask_k = _lora_fwd_inplace(
+            normed_2d, qkv_2d[:, dq : dq + dk], wa_k, wb_k, scale_k, drop_k, comp_dtype
+        )
+        hv, mask_v = _lora_fwd_inplace(
+            normed_2d, qkv_2d[:, dq + dk :], wa_v, wb_v, scale_v, drop_v, comp_dtype
+        )
+        del normed_2d
+
+        q_in = qkv_2d[:, :dq].view(b, s, h_q, head_dim)
+        k_in = qkv_2d[:, dq : dq + dk].view(b, s, h_k, head_dim)
+        q_rot = torch.empty((b, s, h_q, head_dim), dtype=comp_dtype, device=x.device)
+        k_rot = torch.empty((b, s, h_k, head_dim), dtype=comp_dtype, device=x.device)
+        cos_3d, sin_3d = launch_qk_rope_bshd_strided(
+            q_in, k_in, cos, sin, q_rot, k_rot, is_bwd=0, need_q=True, need_k=True
+        )
+        v_bshd = qkv_2d[:, dq + dk :].contiguous().view(b, s, h_k, head_dim)
+        del qkv_2d
+
+        if torch.is_grad_enabled():
+            empty = x_2d[:0, :0]
+            ctx.save_for_backward(
+                x_2d.detach(),
+                norm_w.detach(),
+                r,
+                cos_3d,
+                sin_3d,
+                hq if hq is not None else empty,
+                mask_q if mask_q is not None else empty,
+                hk if hk is not None else empty,
+                mask_k if mask_k is not None else empty,
+                hv if hv is not None else empty,
+                mask_v if mask_v is not None else empty,
+                wa_q.detach() if wa_q is not None else empty,
+                wb_q.detach() if wb_q is not None else empty,
+                wa_k.detach() if wa_k is not None else empty,
+                wb_k.detach() if wb_k is not None else empty,
+                wa_v.detach() if wa_v is not None else empty,
+                wb_v.detach() if wb_v is not None else empty,
+            )
+            ctx.has_lora = (
+                wa_q is not None and wb_q is not None,
+                wa_k is not None and wb_k is not None,
+                wa_v is not None and wb_v is not None,
+            )
+            ctx.orig_shape = orig_shape
+            ctx.norm_eps = norm_eps
+            ctx.qkv_meta = qkv_meta
+            ctx.lora_cfg = lora_cfg
+            ctx.comp_dtype = comp_dtype
+            ctx.head_dim = head_dim
+            ctx.set_materialize_grads(False)
+        return q_rot, k_rot, v_bshd
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_q_rot: torch.Tensor | None,
+        grad_k_rot: torch.Tensor | None,
+        grad_v_bshd: torch.Tensor | None,
+    ):
+        if grad_q_rot is None and grad_k_rot is None and grad_v_bshd is None:
+            return (None,) * 15
+
+        from .nf4_linear import _dequant_triple_to_workspace
+        from .rmsnorm import _norm_launch_cfg, rmsnorm_bwd_2d, triton_rmsnorm_fwd
+        from .rope import launch_qk_rope_bshd_strided
+
+        (
+            x_2d,
+            norm_w,
+            r,
+            cos_3d,
+            sin_3d,
+            hq,
+            mask_q,
+            hk,
+            mask_k,
+            hv,
+            mask_v,
+            wa_q,
+            wb_q,
+            wa_k,
+            wb_k,
+            wa_v,
+            wb_v,
+        ) = ctx.saved_tensors
+        orig_shape = ctx.orig_shape
+        b, s, d = orig_shape[0], orig_shape[1], orig_shape[2]
+        m = b * s
+        q_base, q_qs, k_base, k_qs, v_base, v_qs, dq, dk, dv, _ = ctx.qkv_meta
+        scale_q, drop_q, scale_k, drop_k, scale_v, drop_v = ctx.lora_cfg
+        has_q, has_k, has_v = ctx.has_lora
+        comp_dtype = ctx.comp_dtype
+        head_dim = ctx.head_dim
+        h_q = dq // head_dim
+        h_k = dk // head_dim
+
+        grad_qkv_2d = torch.empty((m, dq + dk + dv), dtype=comp_dtype, device=x_2d.device)
+        dq_view = grad_qkv_2d[:, :dq].view(b, s, h_q, head_dim)
+        dk_view = grad_qkv_2d[:, dq : dq + dk].view(b, s, h_k, head_dim)
+
+        if grad_q_rot is not None or grad_k_rot is not None:
+            gq = (
+                (grad_q_rot if grad_q_rot.dtype == comp_dtype else grad_q_rot.to(comp_dtype)).contiguous()
+                if grad_q_rot is not None
+                else dq_view
+            )
+            gk = (
+                (grad_k_rot if grad_k_rot.dtype == comp_dtype else grad_k_rot.to(comp_dtype)).contiguous()
+                if grad_k_rot is not None
+                else dk_view
+            )
+            launch_qk_rope_bshd_strided(
+                gq,
+                gk,
+                cos_3d,
+                sin_3d,
+                dq_view,
+                dk_view,
+                is_bwd=1,
+                need_q=grad_q_rot is not None,
+                need_k=grad_k_rot is not None,
+            )
+            if grad_q_rot is None:
+                grad_qkv_2d[:, :dq].zero_()
+            if grad_k_rot is None:
+                grad_qkv_2d[:, dq : dq + dk].zero_()
+        else:
+            grad_qkv_2d[:, : dq + dk].zero_()
+
+        if grad_v_bshd is not None:
+            gv = grad_v_bshd if grad_v_bshd.dtype == comp_dtype else grad_v_bshd.to(comp_dtype)
+            grad_qkv_2d[:, dq + dk :].copy_(gv.reshape(m, dv))
+        else:
+            grad_qkv_2d[:, dq + dk :].zero_()
+
+        need_x = ctx.needs_input_grad[0]
+        need_norm_w = ctx.needs_input_grad[1]
+        need_wa_q, need_wb_q = ctx.needs_input_grad[4], ctx.needs_input_grad[5]
+        need_wa_k, need_wb_k = ctx.needs_input_grad[6], ctx.needs_input_grad[7]
+        need_wa_v, need_wb_v = ctx.needs_input_grad[8], ctx.needs_input_grad[9]
+        need_normed = need_x or need_norm_w
+
+        normed_2d = None
+        if (has_q and need_wa_q) or (has_k and need_wa_k) or (has_v and need_wa_v):
+            normed_2d = torch.empty((m, d), dtype=comp_dtype, device=x_2d.device)
+            if m > 0:
+                block, warps = _norm_launch_cfg(d)
+                triton_rmsnorm_fwd[(m,)](
+                    x_2d,
+                    x_2d,
+                    normed_2d,
+                    normed_2d,
+                    norm_w,
+                    r,
+                    x_2d.stride(0),
+                    d,
+                    ctx.norm_eps,
+                    0,
+                    BLOCK_SIZE=block,
+                    num_warps=warps,
+                )
+
+        grad_wa_q, grad_wb_q, dx_q = _lora_bwd_branch(
+            grad_qkv_2d[:, :dq],
+            hq,
+            mask_q,
+            wa_q,
+            wb_q,
+            scale_q,
+            drop_q,
+            has_q,
+            need_wa_q,
+            need_wb_q,
+            need_normed,
+            normed_2d,
+            comp_dtype,
+        )
+        grad_wa_k, grad_wb_k, dx_k = _lora_bwd_branch(
+            grad_qkv_2d[:, dq : dq + dk],
+            hk,
+            mask_k,
+            wa_k,
+            wb_k,
+            scale_k,
+            drop_k,
+            has_k,
+            need_wa_k,
+            need_wb_k,
+            need_normed,
+            normed_2d,
+            comp_dtype,
+        )
+        grad_wa_v, grad_wb_v, dx_v = _lora_bwd_branch(
+            grad_qkv_2d[:, dq + dk :],
+            hv,
+            mask_v,
+            wa_v,
+            wb_v,
+            scale_v,
+            drop_v,
+            has_v,
+            need_wa_v,
+            need_wb_v,
+            need_normed,
+            normed_2d,
+            comp_dtype,
+        )
+        del normed_2d
+
+        dx = None
+        grad_norm_w = None
+        if need_normed:
+            d_normed = None
+            for dx_part in (dx_q, dx_k, dx_v):
+                if dx_part is not None:
+                    d_normed = dx_part if d_normed is None else d_normed.add_(dx_part)
+
+            w_qkv = _dequant_triple_to_workspace(
+                q_base.weight.data,
+                q_qs,
+                k_base.weight.data,
+                k_qs,
+                v_base.weight.data,
+                v_qs,
+                comp_dtype,
+            )
+            if d_normed is not None:
+                d_normed = torch.addmm(d_normed, grad_qkv_2d, w_qkv)
+            else:
+                d_normed = torch.matmul(grad_qkv_2d, w_qkv)
+            del grad_qkv_2d
+
+            if need_norm_w:
+                grad_norm_w = (d_normed.float() * (x_2d.float() * r.unsqueeze(1))).sum(dim=0).to(norm_w.dtype)
+            if need_x:
+                dx = rmsnorm_bwd_2d(d_normed, x_2d, norm_w, r).view(orig_shape)
+            del d_normed
+
+        return (
+            dx,
+            grad_norm_w,
+            None,
+            None,
+            grad_wa_q,
+            grad_wb_q,
+            grad_wa_k,
+            grad_wb_k,
+            grad_wa_v,
+            grad_wb_v,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def _get_fused_qkv_meta(attn_mod):
     cached = getattr(attn_mod, "_soup_qkv_meta", None)
     if cached is not None:
@@ -494,6 +922,7 @@ def _fast_qwen2_mlp_forward(
     s_saved: torch.Tensor | None = None,
     norm_w: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
+    add_residual: bool = False,
 ) -> torch.Tensor:
     from .nf4_linear import TritonNF4SwiGLUMLPFunc, _resolve_bnb_compute_dtype, get_valid_4bit_state
 
@@ -521,9 +950,15 @@ def _fast_qwen2_mlp_forward(
                     s_saved,
                     norm_w,
                     norm_eps,
+                    add_residual,
                 )
 
-    return mlp_mod(hidden_states)
+    out = mlp_mod(hidden_states)
+    if add_residual and s_saved is not None:
+        if out.dtype != s_saved.dtype:
+            out = out.to(s_saved.dtype)
+        return s_saved + out
+    return out
 
 
 def _attention_subblock(
@@ -533,6 +968,71 @@ def _attention_subblock(
     attention_mask: torch.Tensor | None,
     packed_ctx: PackedBatchContext | None,
 ) -> torch.Tensor:
+    attn_mod = layer.self_attn
+    head_dim = attn_mod.head_dim
+    qkv_meta = _get_fused_qkv_meta(attn_mod)
+
+    if (
+        qkv_meta
+        and attention_mask is None
+        and hidden_states.ndim == 3
+        and (head_dim % 8 == 0)
+        and (head_dim // 2) <= 256
+    ):
+        from .nf4_linear import _resolve_bnb_compute_dtype
+
+        q_base, q_qs = qkv_meta[0], qkv_meta[1]
+        comp_dtype = _resolve_bnb_compute_dtype(q_base, hidden_states)
+        if comp_dtype in (torch.float16, torch.bfloat16) and hidden_states.shape[-1] == q_qs.shape[1]:
+            wa_q, wb_q, scale_q, drop_q, ok_q = _extract_single_lora(attn_mod.q_proj)
+            wa_k, wb_k, scale_k, drop_k, ok_k = _extract_single_lora(attn_mod.k_proj)
+            wa_v, wb_v, scale_v, drop_v, ok_v = _extract_single_lora(attn_mod.v_proj)
+            if ok_q and ok_k and ok_v:
+                cos, sin = position_embeddings
+                q_rot, k_rot, v_bshd = TritonFusedAttnQKVRoPEFunc.apply(
+                    hidden_states,
+                    layer.input_layernorm.weight,
+                    cos,
+                    sin,
+                    wa_q,
+                    wb_q,
+                    wa_k,
+                    wb_k,
+                    wa_v,
+                    wb_v,
+                    layer.input_layernorm.variance_epsilon,
+                    qkv_meta,
+                    (scale_q, drop_q, scale_k, drop_k, scale_v, drop_v),
+                    comp_dtype,
+                    head_dim,
+                )
+                dropout_p = attn_mod.attention_dropout if attn_mod.training else 0.0
+                scale = attn_mod.scaling
+                if packed_ctx is not None and packed_ctx.cu_seqlens is not None:
+                    attn_out = VarlenCutlassAttentionFunc.apply(
+                        q_rot,
+                        k_rot,
+                        v_bshd,
+                        packed_ctx.cu_seqlens,
+                        packed_ctx.max_seqlen,
+                        scale,
+                        dropout_p,
+                        packed_ctx.max_seqlen > 1,
+                    )
+                else:
+                    s_len = q_rot.shape[1]
+                    attn_out = VarlenCutlassAttentionFunc.apply(
+                        q_rot,
+                        k_rot,
+                        v_bshd,
+                        None,
+                        s_len,
+                        scale,
+                        dropout_p,
+                        s_len > 1,
+                    )
+                return attn_mod.o_proj(attn_out.reshape(*hidden_states.shape[:-1], -1))
+
     from .rmsnorm import rmsnorm
 
     normed = rmsnorm(
@@ -541,7 +1041,7 @@ def _attention_subblock(
         layer.input_layernorm.variance_epsilon,
     )
     return _fast_qwen2_attention_forward(
-        layer.self_attn,
+        attn_mod,
         normed,
         position_embeddings,
         attention_mask,
@@ -707,10 +1207,13 @@ def install_model_layer_optimizations(causal_lm: torch.nn.Module) -> None:
                         _layer.post_attention_layernorm.weight,
                         _layer.post_attention_layernorm.variance_epsilon,
                     )
-                    mlp_delta = _fast_qwen2_mlp_forward(_layer.mlp, post_normed, recompute_mode=0)
-                    if mlp_delta.dtype != residual.dtype:
-                        mlp_delta = mlp_delta.to(residual.dtype)
-                    return residual + mlp_delta
+                    return _fast_qwen2_mlp_forward(
+                        _layer.mlp,
+                        post_normed,
+                        recompute_mode=0,
+                        s_saved=residual,
+                        add_residual=True,
+                    )
 
                 # Token-aware dynamic checkpointing for Attention sub-block
                 if packed_ctx is not None:
@@ -744,21 +1247,20 @@ def install_model_layer_optimizations(causal_lm: torch.nn.Module) -> None:
                     eps_post,
                 )
 
-                # MLP uses recompute_mode=2 (zero extra saved tensors, zero down_proj recompute,
-                # single w_gate_up dequantization in backward!)
+                # MLP uses recompute_mode=2 + fused residual add (zero AddBackward0 node,
+                # zero extra saved tensors, zero down_proj recompute, 1-launch w_gate_up dequant!)
                 recomp_mode = 0 if _mlp_trainable else 2
-                mlp_delta = _fast_qwen2_mlp_forward(
+                out = _fast_qwen2_mlp_forward(
                     _layer.mlp,
                     post_normed,
                     recompute_mode=recomp_mode,
                     s_saved=residual,
                     norm_w=w_post,
                     norm_eps=eps_post,
+                    add_residual=True,
                 )
-                del post_normed
-                if mlp_delta.dtype != residual.dtype:
-                    mlp_delta = mlp_delta.to(residual.dtype)
-                return residual + mlp_delta
+                del post_normed, residual
+                return out
 
             return _layer_fwd
 

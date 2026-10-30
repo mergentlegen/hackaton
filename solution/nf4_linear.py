@@ -14,24 +14,88 @@ def _get_dequant_workspace(numel: int, dtype: torch.dtype, device: torch.device)
     return get_shared_workspace(numel, dtype, device)
 
 
-@triton.jit(do_not_specialize=["is_nested"])
+@triton.jit(
+    do_not_specialize=[
+        "nb1",
+        "ne1",
+        "nb2",
+        "ne2",
+        "nb3",
+        "ne3",
+        "g1",
+        "g12",
+        "out_off2",
+        "out_off3",
+        "is_nested",
+    ]
+)
 def triton_nf4_dequant_kernel(
-    qweight_ptr,
-    absmax_ptr,
-    s2_absmax_ptr,
-    s2_code_ptr,
-    offset_ptr,
+    qw1_ptr,
+    abs1_ptr,
+    s2a1_ptr,
+    s2c1_ptr,
+    off1_ptr,
+    qw2_ptr,
+    abs2_ptr,
+    s2a2_ptr,
+    s2c2_ptr,
+    off2_ptr,
+    qw3_ptr,
+    abs3_ptr,
+    s2a3_ptr,
+    s2c3_ptr,
+    off3_ptr,
     code_ptr,
     out_ptr,
-    n_bytes,
-    n_elements,
+    nb1,
+    ne1,
+    nb2,
+    ne2,
+    nb3,
+    ne3,
+    g1,
+    g12,
+    out_off2,
+    out_off3,
     is_nested,
     HALF_BLOCKSIZE: tl.constexpr,
     S2_BLOCKSIZE: tl.constexpr,
     BLOCK_BYTES: tl.constexpr,
 ):
+    """Unified single/pair/triple 4-bit NF4/FP4 double-quant dequantization kernel."""
     pid = tl.program_id(0)
-    byte_offs = pid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
+    if pid < g1:
+        lpid = pid
+        qweight_ptr = qw1_ptr
+        absmax_ptr = abs1_ptr
+        s2_absmax_ptr = s2a1_ptr
+        s2_code_ptr = s2c1_ptr
+        offset_ptr = off1_ptr
+        n_bytes = nb1
+        n_elements = ne1
+        dst_ptr = out_ptr
+    elif pid < g12:
+        lpid = pid - g1
+        qweight_ptr = qw2_ptr
+        absmax_ptr = abs2_ptr
+        s2_absmax_ptr = s2a2_ptr
+        s2_code_ptr = s2c2_ptr
+        offset_ptr = off2_ptr
+        n_bytes = nb2
+        n_elements = ne2
+        dst_ptr = out_ptr + out_off2
+    else:
+        lpid = pid - g12
+        qweight_ptr = qw3_ptr
+        absmax_ptr = abs3_ptr
+        s2_absmax_ptr = s2a3_ptr
+        s2_code_ptr = s2c3_ptr
+        offset_ptr = off3_ptr
+        n_bytes = nb3
+        n_elements = ne3
+        dst_ptr = out_ptr + out_off3
+
+    byte_offs = lpid * BLOCK_BYTES + tl.arange(0, BLOCK_BYTES)
     byte_mask = byte_offs < n_bytes
 
     packed = tl.load(qweight_ptr + byte_offs, mask=byte_mask, other=0).to(tl.int32)
@@ -55,9 +119,9 @@ def triton_nf4_dequant_kernel(
     pair = tl.join(val_hi, val_lo)
     vals = tl.reshape(pair, (BLOCK_BYTES * 2,))
 
-    out_offs = pid * (BLOCK_BYTES * 2) + tl.arange(0, BLOCK_BYTES * 2)
+    out_offs = lpid * (BLOCK_BYTES * 2) + tl.arange(0, BLOCK_BYTES * 2)
     out_mask = out_offs < n_elements
-    tl.store(out_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_mask)
+    tl.store(dst_ptr + out_offs, vals.to(out_ptr.dtype.element_ty), mask=out_mask)
 
 
 @triton.jit(do_not_specialize=["is_bwd"])
@@ -111,6 +175,30 @@ def can_triton_dequant(qweight: torch.Tensor, quant_state) -> bool:
     return True
 
 
+def _extract_nf4_slot(qweight: torch.Tensor, quant_state, block_bytes: int = 1024):
+    q_flat = qweight.reshape(-1)
+    nb = q_flat.numel()
+    ne = int(quant_state.shape.numel())
+    g = triton.cdiv(nb, block_bytes)
+    if quant_state.nested:
+        s2 = quant_state.state2
+        return (q_flat, quant_state.absmax, s2.absmax, s2.code, quant_state.offset, nb, ne, g, int(s2.blocksize), 1)
+    dummy = quant_state.code
+    return (q_flat, quant_state.absmax, dummy, dummy, dummy, nb, ne, g, 256, 0)
+
+
+def _compatible_quant_states(qs_a, qs_b) -> bool:
+    if (
+        qs_a.nested != qs_b.nested
+        or qs_a.blocksize != qs_b.blocksize
+        or qs_a.quant_type != qs_b.quant_type
+    ):
+        return False
+    if qs_a.nested and int(qs_a.state2.blocksize) != int(qs_b.state2.blocksize):
+        return False
+    return True
+
+
 def dequantize_nf4_triton(
     qweight: torch.Tensor,
     quant_state,
@@ -121,8 +209,6 @@ def dequantize_nf4_triton(
     target_dtype = dtype if dtype is not None else quant_state.dtype
     shape = quant_state.shape
     n_elements = int(shape.numel())
-    q_flat = qweight.reshape(-1)
-    n_bytes = q_flat.numel()
 
     if out is None:
         out_flat = torch.empty((n_elements,), dtype=target_dtype, device=qweight.device)
@@ -130,45 +216,45 @@ def dequantize_nf4_triton(
         out_flat = out.reshape(-1)[:n_elements]
 
     BLOCK_BYTES = 1024
-    grid = (triton.cdiv(n_bytes, BLOCK_BYTES),)
+    qw1, abs1, s2a1, s2c1, off1, nb1, ne1, g1, s2_bs, is_nested = _extract_nf4_slot(
+        qweight, quant_state, BLOCK_BYTES
+    )
     half_bs = int(quant_state.blocksize) // 2
 
-    if quant_state.nested:
-        s2 = quant_state.state2
-        triton_nf4_dequant_kernel[grid](
-            q_flat,
-            quant_state.absmax,
-            s2.absmax,
-            s2.code,
-            quant_state.offset,
-            quant_state.code,
-            out_flat,
-            n_bytes,
-            n_elements,
-            1,
-            HALF_BLOCKSIZE=half_bs,
-            S2_BLOCKSIZE=int(s2.blocksize),
-            BLOCK_BYTES=BLOCK_BYTES,
-            num_warps=4,
-        )
-    else:
-        dummy = quant_state.code
-        triton_nf4_dequant_kernel[grid](
-            q_flat,
-            quant_state.absmax,
-            dummy,
-            dummy,
-            dummy,
-            quant_state.code,
-            out_flat,
-            n_bytes,
-            n_elements,
-            0,
-            HALF_BLOCKSIZE=half_bs,
-            S2_BLOCKSIZE=256,
-            BLOCK_BYTES=BLOCK_BYTES,
-            num_warps=4,
-        )
+    triton_nf4_dequant_kernel[(g1,)](
+        qw1,
+        abs1,
+        s2a1,
+        s2c1,
+        off1,
+        qw1,
+        abs1,
+        s2a1,
+        s2c1,
+        off1,
+        qw1,
+        abs1,
+        s2a1,
+        s2c1,
+        off1,
+        quant_state.code,
+        out_flat,
+        nb1,
+        ne1,
+        nb1,
+        ne1,
+        nb1,
+        ne1,
+        g1,
+        g1,
+        ne1,
+        ne1,
+        is_nested,
+        HALF_BLOCKSIZE=half_bs,
+        S2_BLOCKSIZE=s2_bs,
+        BLOCK_BYTES=BLOCK_BYTES,
+        num_warps=4,
+    )
 
     out_2d = out_flat.view(shape)
     if qweight.ndim == 2 and qweight.shape[0] == 1 and qweight.shape[1] > 1:
@@ -192,8 +278,53 @@ def _dequant_pair_to_workspace(
     n1 = int(qs1.shape.numel())
     n2 = int(qs2.shape.numel())
     ws = _get_dequant_workspace(n1 + n2, dtype, qw1.device)
-    dequantize_nf4_triton(qw1.view(-1, 1), qs1, dtype=dtype, out=ws[:n1])
-    dequantize_nf4_triton(qw2.view(-1, 1), qs2, dtype=dtype, out=ws[n1 : n1 + n2])
+    if _compatible_quant_states(qs1, qs2):
+        BLOCK_BYTES = 1024
+        q1, abs1, s2a1, s2c1, off1, nb1, ne1, g1, s2_bs, is_nested = _extract_nf4_slot(
+            qw1, qs1, BLOCK_BYTES
+        )
+        q2, abs2, s2a2, s2c2, off2, nb2, ne2, g2, _, _ = _extract_nf4_slot(
+            qw2, qs2, BLOCK_BYTES
+        )
+        g12 = g1 + g2
+        half_bs = int(qs1.blocksize) // 2
+        triton_nf4_dequant_kernel[(g12,)](
+            q1,
+            abs1,
+            s2a1,
+            s2c1,
+            off1,
+            q2,
+            abs2,
+            s2a2,
+            s2c2,
+            off2,
+            q2,
+            abs2,
+            s2a2,
+            s2c2,
+            off2,
+            qs1.code,
+            ws,
+            nb1,
+            ne1,
+            nb2,
+            ne2,
+            nb2,
+            ne2,
+            g1,
+            g12,
+            ne1,
+            ne1 + ne2,
+            is_nested,
+            HALF_BLOCKSIZE=half_bs,
+            S2_BLOCKSIZE=s2_bs,
+            BLOCK_BYTES=BLOCK_BYTES,
+            num_warps=4,
+        )
+    else:
+        dequantize_nf4_triton(qw1.view(-1, 1), qs1, dtype=dtype, out=ws[:n1])
+        dequantize_nf4_triton(qw2.view(-1, 1), qs2, dtype=dtype, out=ws[n1 : n1 + n2])
     return ws.view(qs1.shape[0] + qs2.shape[0], qs1.shape[1])
 
 
@@ -210,9 +341,58 @@ def _dequant_triple_to_workspace(
     n2 = int(qs2.shape.numel())
     n3 = int(qs3.shape.numel())
     ws = _get_dequant_workspace(n1 + n2 + n3, dtype, qw1.device)
-    dequantize_nf4_triton(qw1.view(-1, 1), qs1, dtype=dtype, out=ws[:n1])
-    dequantize_nf4_triton(qw2.view(-1, 1), qs2, dtype=dtype, out=ws[n1 : n1 + n2])
-    dequantize_nf4_triton(qw3.view(-1, 1), qs3, dtype=dtype, out=ws[n1 + n2 : n1 + n2 + n3])
+    if _compatible_quant_states(qs1, qs2) and _compatible_quant_states(qs1, qs3):
+        BLOCK_BYTES = 1024
+        q1, abs1, s2a1, s2c1, off1, nb1, ne1, g1, s2_bs, is_nested = _extract_nf4_slot(
+            qw1, qs1, BLOCK_BYTES
+        )
+        q2, abs2, s2a2, s2c2, off2, nb2, ne2, g2, _, _ = _extract_nf4_slot(
+            qw2, qs2, BLOCK_BYTES
+        )
+        q3, abs3, s2a3, s2c3, off3, nb3, ne3, g3, _, _ = _extract_nf4_slot(
+            qw3, qs3, BLOCK_BYTES
+        )
+        g12 = g1 + g2
+        g123 = g12 + g3
+        half_bs = int(qs1.blocksize) // 2
+        triton_nf4_dequant_kernel[(g123,)](
+            q1,
+            abs1,
+            s2a1,
+            s2c1,
+            off1,
+            q2,
+            abs2,
+            s2a2,
+            s2c2,
+            off2,
+            q3,
+            abs3,
+            s2a3,
+            s2c3,
+            off3,
+            qs1.code,
+            ws,
+            nb1,
+            ne1,
+            nb2,
+            ne2,
+            nb3,
+            ne3,
+            g1,
+            g12,
+            ne1,
+            ne1 + ne2,
+            is_nested,
+            HALF_BLOCKSIZE=half_bs,
+            S2_BLOCKSIZE=s2_bs,
+            BLOCK_BYTES=BLOCK_BYTES,
+            num_warps=4,
+        )
+    else:
+        dequantize_nf4_triton(qw1.view(-1, 1), qs1, dtype=dtype, out=ws[:n1])
+        dequantize_nf4_triton(qw2.view(-1, 1), qs2, dtype=dtype, out=ws[n1 : n1 + n2])
+        dequantize_nf4_triton(qw3.view(-1, 1), qs3, dtype=dtype, out=ws[n1 + n2 : n1 + n2 + n3])
     return ws.view(qs1.shape[0] + qs2.shape[0] + qs3.shape[0], qs1.shape[1])
 
 
@@ -389,16 +569,21 @@ class TritonNF4SwiGLUMLPFunc(torch.autograd.Function):
         s_saved: torch.Tensor | None = None,
         norm_w: torch.Tensor | None = None,
         norm_eps: float = 1e-6,
+        add_residual: bool = False,
     ):
         orig_shape = x.shape
         orig_dtype = x.dtype
+        do_res = bool(add_residual and s_saved is not None)
+        s_dtype = s_saved.dtype if do_res else orig_dtype
         x_2d = (x if orig_dtype == compute_dtype else x.to(compute_dtype)).reshape(-1, orig_shape[-1]).contiguous()
         m = x_2d.shape[0]
         if m == 0:
             ctx.is_empty = True
             ctx.orig_shape = orig_shape
             ctx.orig_dtype = orig_dtype
-            return torch.empty(orig_shape, dtype=orig_dtype, device=x.device)
+            ctx.do_res = do_res
+            ctx.s_dtype = s_dtype
+            return s_saved.clone() if do_res else torch.empty(orig_shape, dtype=orig_dtype, device=x.device)
 
         ctx.is_empty = False
         i_dim = gate_qs.shape[0]
@@ -420,7 +605,17 @@ class TritonNF4SwiGLUMLPFunc(torch.autograd.Function):
         )
 
         w_down = _dequant_to_workspace(down_qw, down_qs, compute_dtype)
-        out_2d = torch.matmul(act, w_down.t())
+        if do_res and s_dtype == compute_dtype:
+            s_2d = s_saved.reshape(m, -1).contiguous()
+            out_2d = torch.addmm(s_2d, act, w_down.t())
+            out = out_2d.view(orig_shape)
+        else:
+            out_2d = torch.matmul(act, w_down.t())
+            out = out_2d.view(orig_shape)
+            if do_res:
+                out = torch.add(s_saved, out)
+            elif out.dtype != orig_dtype:
+                out = out.to(orig_dtype)
         del act
 
         if recompute_mode == 2 and s_saved is not None and norm_w is not None:
@@ -440,24 +635,28 @@ class TritonNF4SwiGLUMLPFunc(torch.autograd.Function):
         ctx.compute_dtype = compute_dtype
         ctx.orig_shape = orig_shape
         ctx.orig_dtype = orig_dtype
+        ctx.do_res = do_res
+        ctx.s_dtype = s_dtype
         ctx.i_dim = i_dim
         ctx.set_materialize_grads(False)
-
-        out = out_2d.view(orig_shape)
-        return out if out.dtype == orig_dtype else out.to(orig_dtype)
+        return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor | None):
-        none_tail = (None,) * 11
         if grad_out is None:
-            return (None, *none_tail)
+            return (None,) * 13
+        grad_s = None
+        if ctx.do_res and ctx.needs_input_grad[9]:
+            grad_s = grad_out if grad_out.dtype == ctx.s_dtype else grad_out.to(ctx.s_dtype)
         if ctx.is_empty:
-            return (
-                torch.zeros(ctx.orig_shape, dtype=ctx.orig_dtype, device=grad_out.device),
-                *none_tail,
+            dx_empty = (
+                torch.zeros(ctx.orig_shape, dtype=ctx.orig_dtype, device=grad_out.device)
+                if ctx.needs_input_grad[0]
+                else None
             )
+            return (dx_empty, None, None, None, None, None, None, None, None, grad_s, None, None, None)
         if not ctx.needs_input_grad[0]:
-            return (None, *none_tail)
+            return (None, None, None, None, None, None, None, None, None, grad_s, None, None, None)
 
         gate_qw, gate_qs, up_qw, up_qs, down_qw, down_qs = ctx.weights
         compute_dtype = ctx.compute_dtype
@@ -513,7 +712,7 @@ class TritonNF4SwiGLUMLPFunc(torch.autograd.Function):
         dx = dx_2d.view(ctx.orig_shape)
         if dx.dtype != ctx.orig_dtype:
             dx = dx.to(ctx.orig_dtype)
-        return (dx, *none_tail)
+        return (dx, None, None, None, None, None, None, None, None, grad_s, None, None, None)
 
 
 def _resolve_bnb_compute_dtype(module, x: torch.Tensor) -> torch.dtype:

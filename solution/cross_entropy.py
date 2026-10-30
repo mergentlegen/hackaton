@@ -8,9 +8,9 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-DEFAULT_CHUNK_TOKENS = 192
+DEFAULT_CHUNK_TOKENS = 176
 
-# Unified per-device reusable workspace shared by chunked LM head AND stacked NF4 MLP/QKV dequant (~55.6 MiB)
+# Unified per-device reusable workspace shared by chunked LM head AND stacked NF4 MLP/QKV dequant (~52.5 MiB)
 _SHARED_WORKSPACE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 

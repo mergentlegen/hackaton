@@ -7,7 +7,17 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["seq_len", "h_q", "has_q", "has_k", "is_bwd"])
+@triton.jit(
+    do_not_specialize=[
+        "stride_cos_b",
+        "stride_sin_b",
+        "seq_len",
+        "h_q",
+        "has_q",
+        "has_k",
+        "is_bwd",
+    ]
+)
 def triton_qk_rope_kernel(
     q_in_ptr,
     k_in_ptr,
@@ -219,6 +229,20 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
+            # Pass valid 16-aligned strides even when a branch is inactive (has_q/has_k == 0)
+            # so Triton 3.6.0 never re-specializes on zero vs non-zero stride arguments.
+            sq0 = gq.stride(0) if need_q else gk.stride(0)
+            sq1 = gq.stride(1) if need_q else gk.stride(1)
+            sq2 = gq.stride(2) if need_q else gk.stride(2)
+            dq0 = dq.stride(0) if need_q else dk.stride(0)
+            dq1 = dq.stride(1) if need_q else dk.stride(1)
+            dq2 = dq.stride(2) if need_q else dk.stride(2)
+            sk0 = gk.stride(0) if need_k else sq0
+            sk1 = gk.stride(1) if need_k else sq1
+            sk2 = gk.stride(2) if need_k else sq2
+            dk0 = dk.stride(0) if need_k else dq0
+            dk1 = dk.stride(1) if need_k else dq1
+            dk2 = dk.stride(2) if need_k else dq2
             triton_qk_rope_kernel[(b * s, h_q + (h_k if need_k else 0))](
                 gq,
                 gk,
@@ -226,18 +250,18 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
                 sin_3d,
                 dq,
                 dk,
-                gq.stride(0) if need_q else 0,
-                gq.stride(1) if need_q else 0,
-                gq.stride(2) if need_q else 0,
-                dq.stride(0) if need_q else 0,
-                dq.stride(1) if need_q else 0,
-                dq.stride(2) if need_q else 0,
-                gk.stride(0) if need_k else 0,
-                gk.stride(1) if need_k else 0,
-                gk.stride(2) if need_k else 0,
-                dk.stride(0) if need_k else 0,
-                dk.stride(1) if need_k else 0,
-                dk.stride(2) if need_k else 0,
+                sq0,
+                sq1,
+                sq2,
+                dq0,
+                dq1,
+                dq2,
+                sk0,
+                sk1,
+                sk2,
+                dk0,
+                dk1,
+                dk2,
                 sc_b,
                 sc_s,
                 ss_b,
@@ -334,6 +358,18 @@ class TritonFusedQKRoPEBSHDFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
+            sq0 = gq.stride(0) if need_q else gk.stride(0)
+            sq2 = gq.stride(2) if need_q else gk.stride(2)
+            sq1 = gq.stride(1) if need_q else gk.stride(1)
+            dq0 = dq.stride(0) if need_q else dk.stride(0)
+            dq2 = dq.stride(2) if need_q else dk.stride(2)
+            dq1 = dq.stride(1) if need_q else dk.stride(1)
+            sk0 = gk.stride(0) if need_k else sq0
+            sk2 = gk.stride(2) if need_k else sq2
+            sk1 = gk.stride(1) if need_k else sq1
+            dk0 = dk.stride(0) if need_k else dq0
+            dk2 = dk.stride(2) if need_k else dq2
+            dk1 = dk.stride(1) if need_k else dq1
             triton_qk_rope_kernel[(b * s, h_q + (h_k if need_k else 0))](
                 gq,
                 gk,
@@ -341,18 +377,18 @@ class TritonFusedQKRoPEBSHDFunc(torch.autograd.Function):
                 sin_3d,
                 dq,
                 dk,
-                gq.stride(0) if need_q else 0,
-                gq.stride(2) if need_q else 0,
-                gq.stride(1) if need_q else 0,
-                dq.stride(0) if need_q else 0,
-                dq.stride(2) if need_q else 0,
-                dq.stride(1) if need_q else 0,
-                gk.stride(0) if need_k else 0,
-                gk.stride(2) if need_k else 0,
-                gk.stride(1) if need_k else 0,
-                dk.stride(0) if need_k else 0,
-                dk.stride(2) if need_k else 0,
-                dk.stride(1) if need_k else 0,
+                sq0,
+                sq2,
+                sq1,
+                dq0,
+                dq2,
+                dq1,
+                sk0,
+                sk2,
+                sk1,
+                dk0,
+                dk2,
+                dk1,
                 sc_b,
                 sc_s,
                 ss_b,
@@ -368,6 +404,64 @@ class TritonFusedQKRoPEBSHDFunc(torch.autograd.Function):
             )
 
         return (dq if need_q else None), (dk if need_k else None), None, None
+
+
+def launch_qk_rope_bshd_strided(
+    q_in: torch.Tensor,
+    k_in: torch.Tensor,
+    cos_3d: torch.Tensor,
+    sin_3d: torch.Tensor,
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    sc_b: int,
+    sc_s: int,
+    ss_b: int,
+    ss_s: int,
+    b: int,
+    s: int,
+    h_q: int,
+    h_k: int,
+    d: int,
+    is_bwd: int,
+) -> None:
+    """Launch BSHD-indexed RoPE directly on strided QKV views (zero copy/slice overhead)."""
+    if b * s <= 0:
+        return
+    half_dim = d // 2
+    block_half = triton.next_power_of_2(half_dim)
+    warps = 2 if block_half <= 64 else 4
+    triton_qk_rope_kernel[(b * s, h_q + h_k)](
+        q_in,
+        k_in,
+        cos_3d,
+        sin_3d,
+        q_out,
+        k_out,
+        q_in.stride(0),
+        q_in.stride(2),
+        q_in.stride(1),
+        q_out.stride(0),
+        q_out.stride(2),
+        q_out.stride(1),
+        k_in.stride(0),
+        k_in.stride(2),
+        k_in.stride(1),
+        k_out.stride(0),
+        k_out.stride(2),
+        k_out.stride(1),
+        sc_b,
+        sc_s,
+        ss_b,
+        ss_s,
+        s,
+        h_q,
+        half_dim,
+        1,
+        1,
+        is_bwd,
+        BLOCK_HALF=block_half,
+        num_warps=warps,
+    )
 
 
 class TritonSingleRoPEFunc(torch.autograd.Function):
@@ -396,12 +490,12 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
                 out.stride(0),
                 out.stride(1),
                 out.stride(2),
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+                x.stride(0),
+                x.stride(1),
+                x.stride(2),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
                 sc_b,
                 sc_s,
                 ss_b,
@@ -444,12 +538,12 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
                 dx.stride(0),
                 dx.stride(1),
                 dx.stride(2),
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+                gq.stride(0),
+                gq.stride(1),
+                gq.stride(2),
+                dx.stride(0),
+                dx.stride(1),
+                dx.stride(2),
                 sc_b,
                 sc_s,
                 ss_b,
