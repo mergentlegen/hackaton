@@ -3,7 +3,7 @@
 Custom `@triton.jit` kernel suite and SM75-aware memory/compute pipeline for `soup train` (`soup-cli==0.77.0`) fine-tuning **Qwen/Qwen2.5-1.5B-Instruct** (4-bit NF4 double-quant, LoRA `r=16, alpha=32` on `q_proj` & `v_proj`) on a single **Kaggle Tesla T4** (15 GiB VRAM, Turing SM75, FP16 AMP).
 
 - **Team Repository**: https://github.com/BAITC-Hacks/hack-1d15670c-team
-- **Public Kaggle T4 Notebook**: `<INSERT_KAGGLE_SAVED_VERSION_URL_AFTER_RUN>`
+- **Public Kaggle T4 Notebook**: https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
 
 ---
 
@@ -60,8 +60,8 @@ All code in `solution/` was written from scratch by our team. We credit the foll
 ## 2. How to Run It
 
 ### A. On Kaggle (Official Tesla T4 Benchmark)
-1. Open our saved public notebook: **`<INSERT_KAGGLE_SAVED_VERSION_URL_AFTER_RUN>`** (or import `templates/kaggle_notebook.ipynb` into Kaggle with **Accelerator: GPU T4 x2** and **Internet: On**).
-2. Ensure cell 1 points to `REPO_URL = "https://github.com/BAITC-Hacks/hack-1d15670c-team.git"` and `COMMIT = "<FINAL_COMMIT_SHA>"`.
+1. Open our saved public notebook: **https://www.kaggle.com/code/nurale/soup-kernel-t4-bench** (or import `templates/kaggle_notebook.ipynb` into Kaggle with **Accelerator: GPU T4 x2** and **Internet: On**).
+2. Ensure cell 1 points to `REPO_URL = "https://github.com/BAITC-Hacks/hack-1d15670c-team.git"` and `COMMIT = "f4a1e6509e14ee1fe815e0cdffe6140dfab43e6b"`.
 3. Click **Save & Run All** (~8–10 minutes). The notebook automatically runs:
    - `python task/prepare_data.py`
    - `python -m pytest solution -q` (19 kernel & end-to-end parity tests)

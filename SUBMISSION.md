@@ -1,9 +1,9 @@
 # Submission: hack-1d15670c-team
 
 ## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/<FINAL_COMMIT_SHA>
+- Repository, final commit: https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/f4a1e6509e14ee1fe815e0cdffe6140dfab43e6b
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in `README.md`):
-  https://www.kaggle.com/code/<KAGGLE_USER>/<NOTEBOOK_SLUG>?scriptVersionId=<VERSION_ID>
+  https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
 - Demo video (up to 3 minutes): <DEMO_VIDEO_LINK>
 - Presentation: <PRESENTATION_LINK>
 
