@@ -18,6 +18,7 @@ def test_items_round_trip_in_backward_order():
     items = [off.save(*(t.clone() for t in pair)) for pair in originals]
     off.end()
     torch.cuda.synchronize()
+    torch.empty(1, device="cuda")  # lets the allocator see the finished copies
     held = torch.cuda.memory_allocated() - before
     per_item = sum(t.numel() * t.element_size() for t in originals[0])
     assert held <= (KEEP + 1) * per_item * 1.1  # only the last KEEP items stay on the GPU
