@@ -275,7 +275,7 @@ class VarlenCutlassAttentionFunc(torch.autograd.Function):
 def _unwrap_4bit_base(proj_mod):
     """Return (base_bnb_mod, is_clean_peft_or_plain) if proj_mod can participate in fused QKV."""
     cls_name = proj_mod.__class__.__name__
-    if cls_name == "Linear4bit" and hasattr(proj_mod, "lora_A"):
+    if hasattr(proj_mod, "lora_A") and hasattr(proj_mod, "base_layer"):
         if proj_mod.disable_adapters or proj_mod.merged:
             return None, False
         for active_adapter in proj_mod.active_adapters:
@@ -447,7 +447,7 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
     ):
         from .nf4_linear import _dequant_triple_to_workspace
         from .rmsnorm import _norm_launch_cfg, triton_rmsnorm_fwd
-        from .rope import launch_qk_rope_bshd_strided
+        from .rope import _normalize_cos_sin, launch_qk_rope_bshd_strided
 
         orig_shape = x.shape
         b, s, d = orig_shape[0], orig_shape[1], orig_shape[2]
@@ -508,45 +508,47 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
         k_in = qkv_2d[:, dq : dq + dk].view(b, s, h_k, head_dim)
         q_rot = torch.empty((b, s, h_q, head_dim), dtype=comp_dtype, device=x.device)
         k_rot = torch.empty((b, s, h_k, head_dim), dtype=comp_dtype, device=x.device)
-        cos_3d, sin_3d = launch_qk_rope_bshd_strided(
-            q_in, k_in, cos, sin, q_rot, k_rot, is_bwd=0, need_q=True, need_k=True
+        cos_3d, sc_b, sc_s = _normalize_cos_sin(cos, s, head_dim)
+        sin_3d, ss_b, ss_s = _normalize_cos_sin(sin, s, head_dim)
+        launch_qk_rope_bshd_strided(
+            q_in, k_in, cos_3d, sin_3d, q_rot, k_rot,
+            sc_b, sc_s, ss_b, ss_s, b, s, h_q, h_k, head_dim, 0,
         )
         v_bshd = qkv_2d[:, dq + dk :].contiguous().view(b, s, h_k, head_dim)
         del qkv_2d
 
-        if torch.is_grad_enabled():
-            empty = x_2d[:0, :0]
-            ctx.save_for_backward(
-                x_2d.detach(),
-                norm_w.detach(),
-                r,
-                cos_3d,
-                sin_3d,
-                hq if hq is not None else empty,
-                mask_q if mask_q is not None else empty,
-                hk if hk is not None else empty,
-                mask_k if mask_k is not None else empty,
-                hv if hv is not None else empty,
-                mask_v if mask_v is not None else empty,
-                wa_q.detach() if wa_q is not None else empty,
-                wb_q.detach() if wb_q is not None else empty,
-                wa_k.detach() if wa_k is not None else empty,
-                wb_k.detach() if wb_k is not None else empty,
-                wa_v.detach() if wa_v is not None else empty,
-                wb_v.detach() if wb_v is not None else empty,
-            )
-            ctx.has_lora = (
-                wa_q is not None and wb_q is not None,
-                wa_k is not None and wb_k is not None,
-                wa_v is not None and wb_v is not None,
-            )
-            ctx.orig_shape = orig_shape
-            ctx.norm_eps = norm_eps
-            ctx.qkv_meta = qkv_meta
-            ctx.lora_cfg = lora_cfg
-            ctx.comp_dtype = comp_dtype
-            ctx.head_dim = head_dim
-            ctx.set_materialize_grads(False)
+        empty = x_2d[:0, :0]
+        ctx.save_for_backward(
+            x_2d.detach(),
+            norm_w.detach(),
+            r,
+            cos_3d,
+            sin_3d,
+            hq if hq is not None else empty,
+            mask_q if mask_q is not None else empty,
+            hk if hk is not None else empty,
+            mask_k if mask_k is not None else empty,
+            hv if hv is not None else empty,
+            mask_v if mask_v is not None else empty,
+            wa_q.detach() if wa_q is not None else empty,
+            wb_q.detach() if wb_q is not None else empty,
+            wa_k.detach() if wa_k is not None else empty,
+            wb_k.detach() if wb_k is not None else empty,
+            wa_v.detach() if wa_v is not None else empty,
+            wb_v.detach() if wb_v is not None else empty,
+        )
+        ctx.has_lora = (
+            wa_q is not None and wb_q is not None,
+            wa_k is not None and wb_k is not None,
+            wa_v is not None and wb_v is not None,
+        )
+        ctx.orig_shape = orig_shape
+        ctx.norm_eps = norm_eps
+        ctx.qkv_meta = qkv_meta
+        ctx.lora_cfg = lora_cfg
+        ctx.comp_dtype = comp_dtype
+        ctx.head_dim = head_dim
+        ctx.set_materialize_grads(False)
         return q_rot, k_rot, v_bshd
 
     @staticmethod
@@ -561,7 +563,7 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
 
         from .nf4_linear import _dequant_triple_to_workspace
         from .rmsnorm import _norm_launch_cfg, rmsnorm_bwd_2d, triton_rmsnorm_fwd
-        from .rope import launch_qk_rope_bshd_strided
+        from .rope import _normalize_cos_sin, launch_qk_rope_bshd_strided
 
         (
             x_2d,
@@ -608,16 +610,11 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
                 if grad_k_rot is not None
                 else dk_view
             )
+            _, sc_b, sc_s = _normalize_cos_sin(cos_3d, s, head_dim)
+            _, ss_b, ss_s = _normalize_cos_sin(sin_3d, s, head_dim)
             launch_qk_rope_bshd_strided(
-                gq,
-                gk,
-                cos_3d,
-                sin_3d,
-                dq_view,
-                dk_view,
-                is_bwd=1,
-                need_q=grad_q_rot is not None,
-                need_k=grad_k_rot is not None,
+                gq, gk, cos_3d, sin_3d, dq_view, dk_view,
+                sc_b, sc_s, ss_b, ss_s, b, s, h_q, h_k, head_dim, 1,
             )
             if grad_q_rot is None:
                 grad_qkv_2d[:, :dq].zero_()
