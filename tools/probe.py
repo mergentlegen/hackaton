@@ -191,8 +191,7 @@ def main():
     args = parser.parse_args()
     sys.argv = ["soup", "train", "--config", args.config, "--yes"]
     torch.empty(1, device="cuda")
-    wrap_model_memory()
-    if args.solution:
+    if args.solution:  # first, so the wrappers below see the solution's forward
         from pathlib import Path
 
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -200,6 +199,7 @@ def main():
 
         solution.apply()
         say("solution applied")
+    wrap_model_memory()
 
     original_init = transformers.Trainer.__init__
 
