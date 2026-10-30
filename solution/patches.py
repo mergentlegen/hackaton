@@ -245,10 +245,18 @@ def patch_kbit_preparation():
             namespace.prepare_model_for_kbit_training = prepare
 
 
+MIN_NF4_WEIGHTS = 1 << 22  # 4.2 M: the MLP projections, not q/k/v/o
+
+
 def patch_nf4_matmul():
     """bitsandbytes' 4-bit matmul (every Linear4bit forward calls `bnb.matmul_4bit`) through
     our NF4 decode kernel (nf4.py) when the weight is NF4 with plain fp32 scales and the input
-    is a batch of rows in the weight's compute dtype; anything else goes to bitsandbytes."""
+    is a batch of rows in the weight's compute dtype; anything else goes to bitsandbytes.
+
+    Only the large weights (the three MLP projections, 13.8 M values each: 89% of all 4-bit
+    weight bytes) take this path: every launch of a solution kernel costs some CPU time in the
+    measured run (the harness wraps it in two CUDA events), and the 112 small q/k/v/o decodes a
+    step would add that cost for 11% of the bytes."""
     import bitsandbytes as bnb
 
     from .nf4 import can_dequantize, nf4_linear
@@ -260,6 +268,7 @@ def patch_nf4_matmul():
         if (out is None and state is not None and isinstance(A, torch.Tensor) and A.is_cuda
                 and A.dim() >= 2 and A.numel() // max(A.shape[-1], 1) > 4
                 and len(getattr(state, "shape", ())) == 2 and A.shape[-1] == state.shape[1]
+                and state.shape[0] * state.shape[1] >= MIN_NF4_WEIGHTS
                 and A.dtype == state.dtype and can_dequantize(B, state)
                 and (bias is None or bias.dtype == A.dtype)):
             return nf4_linear(A, B, bias, state)
