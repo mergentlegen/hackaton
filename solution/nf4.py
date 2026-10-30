@@ -24,30 +24,19 @@ OUTPUTS = 2048  # weights decoded per program (tools/nf4_bench.py: 254 us for 89
 WARPS = 4  # T4, bitsandbytes 225 us; one lane per output was 288-520 us, a select chain slower)
 
 
-@triton.jit(do_not_specialize=["n_first", "n_out", "first_programs"])
-def nf4_dequant_kernel(p0, a0, c0, p1, a1, c1, out_ptr, n_first, n_out, first_programs,
-                       BLOCKSIZE: tl.constexpr, OUTPUTS: tl.constexpr):
-    # Output rows [0, n_first) come from weight 0, the rest from weight 1 (the gate and up
-    # projections decoded into one buffer for one matmul); the first `first_programs` programs
-    # decode weight 0. One lane per byte: its two weights are written by two stores at stride 2,
-    # which together cover the same cache lines.
-    pid = tl.program_id(0)
-    if pid < first_programs:
-        packed_ptr, absmax_ptr, code_ptr = p0, a0, c0
-        start, n_bytes = n_first * 0, n_first // 2  # (an int32 zero, like the other branch)
-    else:
-        packed_ptr, absmax_ptr, code_ptr = p1, a1, c1
-        pid = pid - first_programs
-        start, n_bytes = n_first, (n_out - n_first) // 2
-    offs = pid.to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
-    mask = offs < n_bytes
+@triton.jit(do_not_specialize=["n_out"])
+def nf4_dequant_kernel(packed_ptr, absmax_ptr, code_ptr, out_ptr, n_out, BLOCKSIZE: tl.constexpr,
+                       OUTPUTS: tl.constexpr):
+    # one lane per byte: its two weights are written by two stores at stride 2, which together
+    # cover the same cache lines
+    offs = tl.program_id(0).to(tl.int64) * (OUTPUTS // 2) + tl.arange(0, OUTPUTS // 2)
+    mask = offs < n_out // 2
     byte = tl.load(packed_ptr + offs, mask=mask, other=0).to(tl.int32)
     scale = tl.load(absmax_ptr + offs // (BLOCKSIZE // 2), mask=mask, other=0.0)
     first = tl.load(code_ptr + (byte >> 4)) * scale  # high nibble: the first weight
     second = tl.load(code_ptr + (byte & 15)) * scale
-    out = out_ptr + start + 2 * offs
-    tl.store(out, first.to(out_ptr.dtype.element_ty), mask=mask)
-    tl.store(out + 1, second.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_ptr + 2 * offs, first.to(out_ptr.dtype.element_ty), mask=mask)
+    tl.store(out_ptr + 2 * offs + 1, second.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _numel(shape):
@@ -69,34 +58,17 @@ def can_dequantize(packed, state):
             and getattr(state, "dtype", None) in (torch.float16, torch.bfloat16, torch.float32))
 
 
-def _code(state, device):
+def dequantize_nf4(packed, state):
+    """The weight `state.shape` in `state.dtype` from its packed NF4 bytes."""
+    out = torch.empty(state.shape, dtype=state.dtype, device=packed.device)
+    n_out = out.numel()
     code = state.code
-    if code.device != device or code.dtype != torch.float32:
-        code = code.to(device=device, dtype=torch.float32)
-    return code
-
-
-def dequantize_nf4(packed, state, second=None):
-    """The weight `state.shape` in `state.dtype` from its packed NF4 bytes; with `second` =
-    (packed, state) of a weight with the same number of columns, both stacked by rows."""
-    device = packed.device
-    pb, sb = second if second is not None else (packed, state)
-    rows = state.shape[0] + (sb.shape[0] if second is not None else 0)
-    out = torch.empty(rows, state.shape[1], dtype=state.dtype, device=device)
-    n_first = _numel(state.shape)
-    first_programs = triton.cdiv(n_first, OUTPUTS)
-    programs = first_programs + (triton.cdiv(out.numel() - n_first, OUTPUTS) if second else 0)
-    nf4_dequant_kernel[(programs,)](
-        packed, state.absmax, _code(state, device), pb, sb.absmax, _code(sb, device), out,
-        n_first, out.numel(), first_programs, BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS,
+    if code.device != packed.device or code.dtype != torch.float32:
+        code = code.to(device=packed.device, dtype=torch.float32)
+    nf4_dequant_kernel[(triton.cdiv(n_out, OUTPUTS),)](
+        packed, state.absmax, code, out, n_out, BLOCKSIZE=state.blocksize, OUTPUTS=OUTPUTS,
         num_warps=WARPS)
     return out
-
-
-def can_stack(pa, sa, pb, sb):
-    return (can_dequantize(pa, sa) and can_dequantize(pb, sb) and sa.shape[1] == sb.shape[1]
-            and sa.dtype == sb.dtype and sa.blocksize == sb.blocksize
-            and _numel(sa.shape) % sa.blocksize == 0)
 
 
 class NF4Linear(torch.autograd.Function):
@@ -126,26 +98,3 @@ class NF4Linear(torch.autograd.Function):
 
 def nf4_linear(x, packed, bias, state):
     return NF4Linear.apply(x, packed.reshape(-1), bias, state)
-
-
-class NF4StackedLinear(torch.autograd.Function):
-    """x @ [Wa; Wb]^T for two frozen NF4 weights with the same input (Qwen2's gate and up
-    projections): both decoded into one buffer by one launch, one matmul with twice the output
-    columns, and in the backward one matmul gives d x = [d_a | d_b] @ [Wa; Wb] (the two products
-    summed inside the matmul instead of an extra addition)."""
-
-    @staticmethod
-    def forward(ctx, x, pa, pb, sa, sb):
-        weight = dequantize_nf4(pa, sa, (pb, sb))
-        ctx.parts = (pa, sa, pb, sb)
-        return torch.nn.functional.linear(x, weight.to(x.dtype))
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        pa, sa, pb, sb = ctx.parts
-        weight = dequantize_nf4(pa, sa, (pb, sb))
-        return torch.matmul(grad_output, weight.to(grad_output.dtype)), None, None, None, None
-
-
-def nf4_stacked_linear(x, pa, sa, pb, sb):
-    return NF4StackedLinear.apply(x, pa.reshape(-1), pb.reshape(-1), sa, sb)

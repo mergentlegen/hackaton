@@ -62,33 +62,3 @@ def test_linear_matches_bitsandbytes_forward_and_backward():
     out.backward(grad)
     torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(x.grad, ref_grad, rtol=2e-3, atol=2e-3)
-
-
-def test_stacked_gate_up_matches_two_bitsandbytes_linears_and_swiglu():
-    import bitsandbytes as bnb
-
-    from solution.kernels import silu_mul, silu_mul_packed
-    from solution.nf4 import can_stack, nf4_stacked_linear
-
-    pg, sg = quantized(1024, 1536, True)
-    pu, su = quantized(1024, 1536, True)
-    pu = pu.clone()
-    sg, su = flat(sg), flat(su)
-    torch.manual_seed(1)
-    su.absmax = su.absmax * 1.5  # a different second weight
-    assert can_stack(pg, sg, pu, su)
-    x = torch.randn(300, 1536, device="cuda").half().requires_grad_()
-    grad = torch.randn(300, 1024, device="cuda").half()
-
-    ref = silu_mul(bnb.matmul_4bit(x, pg.t(), quant_state=sg),
-                   bnb.matmul_4bit(x, pu.t(), quant_state=su))
-    ref.backward(grad)
-    ref_grad = x.grad.clone()
-    x.grad = None
-    out = silu_mul_packed(nf4_stacked_linear(x, pg, sg, pu, su))
-    out.backward(grad)
-    torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
-    cos = torch.nn.functional.cosine_similarity(x.grad.float().flatten(), ref_grad.float().flatten(),
-                                                dim=0)
-    assert cos > 0.9999
-    torch.testing.assert_close(x.grad, ref_grad, rtol=1e-2, atol=1e-2)
