@@ -3,6 +3,7 @@
 import torch
 
 from .kernels import fused_cross_entropy, silu_mul
+from .attention import qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .rmsnorm import rms_norm
 
@@ -67,6 +68,48 @@ def patch_causal_lm_loss():
     for key, value in list(loss_utils.LOSS_MAPPING.items()):
         if value is original:
             loss_utils.LOSS_MAPPING[key] = fused_loss
+
+
+def _autocast_fp16():
+    try:
+        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+    except (TypeError, RuntimeError):  # older torch without the device argument
+        return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+
+
+def patch_qwen2_attention():
+    """Qwen2Attention with the rotation, the fp16 casts and the GQA key/value expansion done by
+    the kernels of attention.py. Anything else (a cache, a sliding window, no mask, another
+    attention implementation, fp16 stream) goes through the original code."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2Attention.forward
+
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
+                **kwargs):
+        cos, sin = position_embeddings
+        config = self.config
+        if (past_key_values is not None or attention_mask is None or attention_mask.dim() != 4
+                or getattr(config, "_attn_implementation", None) != "sdpa"
+                or self.sliding_window is not None
+                or (self.training and self.attention_dropout > 0.0)
+                or hidden_states.dtype != torch.float32 or cos.dtype != torch.float32
+                or not hidden_states.is_cuda or not _autocast_fp16()
+                or self.head_dim % 2 != 0
+                or config.num_attention_heads % config.num_key_value_heads != 0):
+            return original(self, hidden_states, position_embeddings, attention_mask,
+                            past_key_values, **kwargs)
+        batch, seq = hidden_states.shape[:2]
+        query, key, value = qkv_rotate(self.q_proj(hidden_states), self.k_proj(hidden_states),
+                                       self.v_proj(hidden_states), cos, sin,
+                                       config.num_attention_heads, config.num_key_value_heads)
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling,
+            is_causal=False)
+        attn = attn.transpose(1, 2).reshape(batch, seq, -1)
+        return self.o_proj(attn), None
+
+    modeling_qwen2.Qwen2Attention.forward = forward
 
 
 def patch_qwen2_rmsnorm():
