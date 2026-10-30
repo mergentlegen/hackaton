@@ -2,10 +2,11 @@
 
 import torch
 
-from .kernels import fused_cross_entropy, silu_mul
+from .kernels import fused_cross_entropy, silu_mul, silu_mul_packed
 from .attention import pack_rows, packed_attention, qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .packed_logits import PackedLogits
+from .nf4 import nf4_stacked_linear
 from .rmsnorm import rms_norm
 
 
@@ -17,8 +18,19 @@ def _is_4bit_linear(module):
     return isinstance(module, bnb.nn.Linear4bit)
 
 
+def _stackable(gate_proj, up_proj, x):
+    from .nf4 import can_stack
+
+    gw, uw = gate_proj.weight, up_proj.weight
+    gs, us = getattr(gw, "quant_state", None), getattr(uw, "quant_state", None)
+    return (gate_proj.bias is None and up_proj.bias is None and gs is not None
+            and us is not None and x.dim() >= 2 and x.numel() // max(x.shape[-1], 1) > 4
+            and len(gs.shape) == 2 and x.shape[-1] == gs.shape[1] and x.dtype == gs.dtype
+            and can_stack(gw, gs, uw, us))
+
+
 def patch_qwen2_mlp():
-    """Qwen2MLP in fp16 end to end.
+    """Qwen2MLP in fp16 end to end, gate and up as one stacked matmul.
 
     The reference casts the fp32 stream to fp16 inside every 4-bit linear and casts each result
     back to fp32, so it keeps three fp32 (tokens, 8960) tensors per layer. Here the input is cast
@@ -37,7 +49,13 @@ def patch_qwen2_mlp():
             return original(self, x)
         compute = getattr(gate_proj, "compute_dtype", None) or torch.float16
         x16 = x.to(compute)
-        hidden = silu_mul(gate_proj(x16), up_proj(x16))
+        if _stackable(gate_proj, up_proj, x16):
+            # gate and up: one decode launch and one matmul into [gate | up] (nf4.py)
+            gw, uw = gate_proj.weight, up_proj.weight
+            gate_up = nf4_stacked_linear(x16, gw, gw.quant_state, uw, uw.quant_state)
+            hidden = silu_mul_packed(gate_up)
+        else:
+            hidden = silu_mul(gate_proj(x16), up_proj(x16))
         return down_proj(hidden).to(x.dtype)
 
     modeling_qwen2.Qwen2MLP.forward = forward

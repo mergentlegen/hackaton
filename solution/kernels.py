@@ -28,27 +28,36 @@ NEG = tl.constexpr(-1.0e30)  # a finite "minus infinity": exp(NEG - x) is 0 and 
 # SwiGLU on fp16 tensors: out = silu(gate) * up, rounded to fp16 once.
 # The reference path computes silu in fp32 on fp16-exact values and the next matmul casts the
 # product to fp16, so rounding once at the end gives the same numbers as the fp32 reference.
+# Grid (rows, column blocks); gate / up rows are `in_stride` apart, so they can be the two halves
+# of one (rows, 2 * cols) matmul output (the fused gate + up projection, nf4.py), and the
+# gradients are written in the same layout, ready for the fused backward matmul.
 # mode 0 (forward):  p0 = gate, p1 = up, p2 = out
 # mode 1 (backward): p0 = d_out, p1 = gate, p2 = up, p3 = d_gate, p4 = d_up
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["n_elements", "mode"])
-def silu_mul_kernel(p0, p1, p2, p3, p4, n_elements, mode, BLOCK: tl.constexpr):
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_elements
+@triton.jit(do_not_specialize=["cols", "in_stride", "mode"])
+def silu_mul_kernel(p0, p1, p2, p3, p4, cols, in_stride, mode, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    at_in = row * in_stride + col  # gate, up and their gradients
+    at_out = row * cols + col  # out and its gradient: contiguous rows
     if mode == 0:
-        gate = tl.load(p0 + offs, mask=mask, other=0.0).to(tl.float32)
-        up = tl.load(p1 + offs, mask=mask, other=0.0).to(tl.float32)
-        act = gate * tl.sigmoid(gate)
-        tl.store(p2 + offs, (act * up).to(p2.dtype.element_ty), mask=mask)
+        gate = tl.load(p0 + at_in, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(p1 + at_in, mask=mask, other=0.0).to(tl.float32)
+        tl.store(p2 + at_out, (gate * tl.sigmoid(gate) * up).to(p2.dtype.element_ty), mask=mask)
     else:
-        dout = tl.load(p0 + offs, mask=mask, other=0.0).to(tl.float32)
-        gate = tl.load(p1 + offs, mask=mask, other=0.0).to(tl.float32)
-        up = tl.load(p2 + offs, mask=mask, other=0.0).to(tl.float32)
+        dout = tl.load(p0 + at_out, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(p1 + at_in, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(p2 + at_in, mask=mask, other=0.0).to(tl.float32)
         sig = tl.sigmoid(gate)
-        tl.store(p4 + offs, (dout * gate * sig).to(p4.dtype.element_ty), mask=mask)
-        dact = dout * up
-        tl.store(p3 + offs, (dact * sig * (1.0 + gate * (1.0 - sig))).to(
+        tl.store(p4 + at_in, (dout * gate * sig).to(p4.dtype.element_ty), mask=mask)
+        tl.store(p3 + at_in, (dout * up * sig * (1.0 + gate * (1.0 - sig))).to(
             p3.dtype.element_ty), mask=mask)
+
+
+def _swiglu(p0, p1, p2, p3, p4, rows, cols, in_stride, mode):
+    silu_mul_kernel[(rows, triton.cdiv(cols, ACT_BLOCK))](p0, p1, p2, p3, p4, cols, in_stride,
+                                                          mode, BLOCK=ACT_BLOCK)
 
 
 class SiluMul(torch.autograd.Function):
@@ -58,10 +67,10 @@ class SiluMul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, gate, up, offload):
         gate, up = gate.contiguous(), up.contiguous()
+        cols = gate.shape[-1]
+        rows = gate.numel() // cols
         out = torch.empty_like(gate)
-        n = gate.numel()
-        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](gate, up, out, out, out, n, 0,
-                                                      BLOCK=ACT_BLOCK)
+        _swiglu(gate, up, out, out, out, rows, cols, cols, 0)
         if offload:
             ctx.item = OFFLOADER.save(gate, up)
         else:
@@ -76,15 +85,50 @@ class SiluMul(torch.autograd.Function):
             gate, up = ctx.saved_tensors
         dout = dout.contiguous()
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
-        n = gate.numel()
-        silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](dout, gate, up, dgate, dup, n, 1,
-                                                      BLOCK=ACT_BLOCK)
+        cols = gate.shape[-1]
+        _swiglu(dout, gate, up, dgate, dup, gate.numel() // cols, cols, cols, 1)
         return dgate, dup, None
+
+
+class SiluMulPacked(torch.autograd.Function):
+    """The same on one (rows, 2 * cols) tensor holding [gate | up] per row (the fused gate + up
+    matmul): (rows, cols) out; the gradient comes back in the same [d_gate | d_up] layout."""
+
+    @staticmethod
+    def forward(ctx, gate_up, offload):
+        gate_up = gate_up.contiguous()
+        rows, both = gate_up.shape
+        cols = both // 2
+        out = torch.empty(rows, cols, dtype=gate_up.dtype, device=gate_up.device)
+        _swiglu(gate_up, gate_up[:, cols:], out, out, out, rows, cols, both, 0)
+        if offload:
+            ctx.item = OFFLOADER.save(gate_up)
+        else:
+            ctx.save_for_backward(gate_up)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        (gate_up,) = OFFLOADER.load(ctx.item) if hasattr(ctx, "item") else ctx.saved_tensors
+        rows, both = gate_up.shape
+        cols = both // 2
+        dout = dout.contiguous()
+        grad = torch.empty_like(gate_up)
+        _swiglu(dout, gate_up, gate_up[:, cols:], grad, grad[:, cols:], rows, cols, both, 1)
+        return grad, None
 
 
 def silu_mul(gate, up):
     offload = (gate.requires_grad or up.requires_grad) and OFFLOADER.wants(gate, up)
     return SiluMul.apply(gate, up, offload)
+
+
+def silu_mul_packed(gate_up):
+    """silu(gate_up[..., :c]) * gate_up[..., c:] for c = half the last dimension."""
+    lead = gate_up.shape[:-1]
+    flat = gate_up.reshape(-1, gate_up.shape[-1])
+    offload = flat.requires_grad and OFFLOADER.wants(flat)
+    return SiluMulPacked.apply(flat, offload).reshape(*lead, -1)
 
 
 # --------------------------------------------------------------------------------------------
