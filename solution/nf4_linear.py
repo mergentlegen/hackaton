@@ -299,15 +299,21 @@ def can_triton_dequant(qweight: torch.Tensor, quant_state) -> bool:
 
 
 def _extract_nf4_slot(qweight: torch.Tensor, quant_state, block_bytes: int = 1024):
+    cached = getattr(quant_state, "_cached_slot", None)
+    if cached is not None and cached[0] is qweight:
+        return cached[1]
     q_flat = qweight.reshape(-1)
     nb = q_flat.numel()
     ne = int(quant_state.shape.numel())
     g = triton.cdiv(nb, block_bytes)
     if quant_state.nested:
         s2 = quant_state.state2
-        return (q_flat, quant_state.absmax, s2.absmax, s2.code, quant_state.offset, nb, ne, g, int(s2.blocksize), 1)
-    dummy = quant_state.code
-    return (q_flat, quant_state.absmax, dummy, dummy, dummy, nb, ne, g, 256, 0)
+        slot = (q_flat, quant_state.absmax, s2.absmax, s2.code, quant_state.offset, nb, ne, g, int(s2.blocksize), 1)
+    else:
+        dummy = quant_state.code
+        slot = (q_flat, quant_state.absmax, dummy, dummy, dummy, nb, ne, g, 256, 0)
+    quant_state._cached_slot = (qweight, slot)
+    return slot
 
 
 def _compatible_quant_states(qs_a, qs_b) -> bool:

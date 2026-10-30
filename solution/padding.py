@@ -11,8 +11,8 @@ from torch.nn import functional as F
 
 _TLS = threading.local()
 
-# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~1.9-2.0 GiB while running ALL layers uncheckpointed
-_ATTN_UNCKPT_BUDGET_MIB = 260.0
+# Cap extra uncheckpointed-attention memory so peak GPU memory stays ~2.1-2.3 GiB while running ALL 28 layers uncheckpointed
+_ATTN_UNCKPT_BUDGET_MIB = 650.0
 _ATTN_MIB_PER_TOKEN = 0.0100  # ~10 KB/token with TritonFusedAttnQKVRoPEFunc (compact 2-head KV + 1-byte masks)
 
 
@@ -328,26 +328,35 @@ def _apply_lora_adapters_2d(proj_mod, x: torch.Tensor, base_slice_2d: torch.Tens
 
 def _extract_single_lora(proj_mod):
     """Extract (wa, wb, scaling, drop_p, is_supported) for fused in-place LoRA execution."""
+    cached = getattr(proj_mod, "_soup_single_lora", None)
+    if cached is not None:
+        return cached
     if not hasattr(proj_mod, "lora_A"):
-        return None, None, 0.0, 0.0, True
-    if proj_mod.disable_adapters or proj_mod.merged:
-        return None, None, 0.0, 0.0, False
-    active = [a for a in proj_mod.active_adapters if a in proj_mod.lora_A]
-    if len(active) == 0:
-        return None, None, 0.0, 0.0, True
-    if len(active) > 1:
-        return None, None, 0.0, 0.0, False
-    a = active[0]
-    if a in getattr(proj_mod, "lora_variant", {}):
-        return None, None, 0.0, 0.0, False
-    lora_A = proj_mod.lora_A[a]
-    lora_B = proj_mod.lora_B[a]
-    if lora_A.bias is not None or lora_B.bias is not None:
-        return None, None, 0.0, 0.0, False
-    dropout = proj_mod.lora_dropout[a]
-    drop_p = float(getattr(dropout, "p", 0.0)) if getattr(dropout, "training", False) else 0.0
-    scaling = float(proj_mod.scaling[a])
-    return lora_A.weight, lora_B.weight, scaling, drop_p, True
+        res = (None, None, 0.0, 0.0, True)
+    elif proj_mod.disable_adapters or proj_mod.merged:
+        res = (None, None, 0.0, 0.0, False)
+    else:
+        active = [a for a in proj_mod.active_adapters if a in proj_mod.lora_A]
+        if len(active) == 0:
+            res = (None, None, 0.0, 0.0, True)
+        elif len(active) > 1:
+            res = (None, None, 0.0, 0.0, False)
+        else:
+            a = active[0]
+            if a in getattr(proj_mod, "lora_variant", {}):
+                res = (None, None, 0.0, 0.0, False)
+            else:
+                lora_A = proj_mod.lora_A[a]
+                lora_B = proj_mod.lora_B[a]
+                if lora_A.bias is not None or lora_B.bias is not None:
+                    res = (None, None, 0.0, 0.0, False)
+                else:
+                    dropout = proj_mod.lora_dropout[a]
+                    drop_p = float(getattr(dropout, "p", 0.0)) if getattr(dropout, "training", False) else 0.0
+                    scaling = float(proj_mod.scaling[a])
+                    res = (lora_A.weight, lora_B.weight, scaling, drop_p, True)
+    proj_mod._soup_single_lora = res
+    return res
 
 
 def _lora_fwd_inplace(
@@ -393,21 +402,19 @@ def _lora_bwd_branch(
     grad_wb = None
     dx_lora = None
     if need_wb:
-        grad_wb = torch.matmul(g_slice.t(), h).to(wb.dtype).mul_(scale)
+        grad_wb = torch.matmul(g_slice.t(), h).float().mul_(scale)
     if need_wa or need_dx:
-        wb_c = wb if wb.dtype == comp_dtype else wb.to(comp_dtype)
-        dh = torch.matmul(g_slice, wb_c).mul_(scale)
+        dh = torch.matmul(g_slice, wb).mul_(scale)
         if need_wa and normed_2d is not None:
             x_drop = (
                 torch._masked_scale(normed_2d, mask, 1.0 / (1.0 - drop_p))
                 if drop_p > 0.0
                 else normed_2d
             )
-            grad_wa = torch.matmul(dh.t(), x_drop).to(wa.dtype)
+            grad_wa = torch.matmul(dh.t(), x_drop).float()
             del x_drop
         if need_dx:
-            wa_c = wa if wa.dtype == comp_dtype else wa.to(comp_dtype)
-            dx_drop = torch.matmul(dh, wa_c)
+            dx_drop = torch.matmul(dh, wa)
             dx_lora = (
                 torch._masked_scale(dx_drop, mask, 1.0 / (1.0 - drop_p))
                 if drop_p > 0.0
@@ -493,14 +500,21 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
         )
         qkv_2d = F.linear(normed_2d, w_qkv, b_comp)
 
+        wa_q_c = wa_q if wa_q is None or wa_q.dtype == comp_dtype else wa_q.to(comp_dtype)
+        wb_q_c = wb_q if wb_q is None or wb_q.dtype == comp_dtype else wb_q.to(comp_dtype)
+        wa_k_c = wa_k if wa_k is None or wa_k.dtype == comp_dtype else wa_k.to(comp_dtype)
+        wb_k_c = wb_k if wb_k is None or wb_k.dtype == comp_dtype else wb_k.to(comp_dtype)
+        wa_v_c = wa_v if wa_v is None or wa_v.dtype == comp_dtype else wa_v.to(comp_dtype)
+        wb_v_c = wb_v if wb_v is None or wb_v.dtype == comp_dtype else wb_v.to(comp_dtype)
+
         hq, mask_q = _lora_fwd_inplace(
-            normed_2d, qkv_2d[:, :dq], wa_q, wb_q, scale_q, drop_q, comp_dtype
+            normed_2d, qkv_2d[:, :dq], wa_q_c, wb_q_c, scale_q, drop_q, comp_dtype
         )
         hk, mask_k = _lora_fwd_inplace(
-            normed_2d, qkv_2d[:, dq : dq + dk], wa_k, wb_k, scale_k, drop_k, comp_dtype
+            normed_2d, qkv_2d[:, dq : dq + dk], wa_k_c, wb_k_c, scale_k, drop_k, comp_dtype
         )
         hv, mask_v = _lora_fwd_inplace(
-            normed_2d, qkv_2d[:, dq + dk :], wa_v, wb_v, scale_v, drop_v, comp_dtype
+            normed_2d, qkv_2d[:, dq + dk :], wa_v_c, wb_v_c, scale_v, drop_v, comp_dtype
         )
 
         q_in = qkv_2d[:, :dq].view(b, s, h_q, head_dim)
@@ -530,12 +544,12 @@ class TritonFusedAttnQKVRoPEFunc(torch.autograd.Function):
             mask_k if mask_k is not None else empty,
             hv if hv is not None else empty,
             mask_v if mask_v is not None else empty,
-            wa_q.detach() if wa_q is not None else empty,
-            wb_q.detach() if wb_q is not None else empty,
-            wa_k.detach() if wa_k is not None else empty,
-            wb_k.detach() if wb_k is not None else empty,
-            wa_v.detach() if wa_v is not None else empty,
-            wb_v.detach() if wb_v is not None else empty,
+            wa_q_c.detach() if wa_q_c is not None else empty,
+            wb_q_c.detach() if wb_q_c is not None else empty,
+            wa_k_c.detach() if wa_k_c is not None else empty,
+            wb_k_c.detach() if wb_k_c is not None else empty,
+            wa_v_c.detach() if wa_v_c is not None else empty,
+            wb_v_c.detach() if wb_v_c is not None else empty,
         )
         ctx.has_lora = (
             wa_q is not None and wb_q is not None,
@@ -903,31 +917,37 @@ def _fast_qwen2_mlp_forward(
 ) -> torch.Tensor:
     from .nf4_linear import TritonNF4SwiGLUMLPFunc, _resolve_bnb_compute_dtype, get_valid_4bit_state
 
-    gate_mod = mlp_mod.gate_proj
-    up_mod = mlp_mod.up_proj
-    down_mod = mlp_mod.down_proj
+    meta = getattr(mlp_mod, "_soup_mlp_meta", None)
+    if meta is None:
+        gate_mod = mlp_mod.gate_proj
+        up_mod = mlp_mod.up_proj
+        down_mod = mlp_mod.down_proj
+        if gate_mod.bias is None and up_mod.bias is None and down_mod.bias is None:
+            g_qs = get_valid_4bit_state(gate_mod)
+            u_qs = get_valid_4bit_state(up_mod)
+            d_qs = get_valid_4bit_state(down_mod)
+            if g_qs is not None and u_qs is not None and d_qs is not None:
+                meta = (gate_mod.weight.data, g_qs, up_mod.weight.data, u_qs, down_mod.weight.data, d_qs)
+        mlp_mod._soup_mlp_meta = meta if meta is not None else False
 
-    if gate_mod.bias is None and up_mod.bias is None and down_mod.bias is None:
-        g_qs = get_valid_4bit_state(gate_mod)
-        u_qs = get_valid_4bit_state(up_mod)
-        d_qs = get_valid_4bit_state(down_mod)
-        if g_qs is not None and u_qs is not None and d_qs is not None:
-            comp_dtype = _resolve_bnb_compute_dtype(gate_mod, hidden_states)
-            if comp_dtype in (torch.float16, torch.bfloat16, torch.float32):
-                return TritonNF4SwiGLUMLPFunc.apply(
-                    hidden_states,
-                    gate_mod.weight.data,
-                    g_qs,
-                    up_mod.weight.data,
-                    u_qs,
-                    down_mod.weight.data,
-                    d_qs,
-                    comp_dtype,
-                    recompute_mode,
-                    s_saved,
-                    norm_w,
-                    norm_eps,
-                )
+    if meta:
+        g_w, g_qs, u_w, u_qs, d_w, d_qs = meta
+        comp_dtype = _resolve_bnb_compute_dtype(mlp_mod.gate_proj, hidden_states)
+        if comp_dtype in (torch.float16, torch.bfloat16, torch.float32):
+            return TritonNF4SwiGLUMLPFunc.apply(
+                hidden_states,
+                g_w,
+                g_qs,
+                u_w,
+                u_qs,
+                d_w,
+                d_qs,
+                comp_dtype,
+                recompute_mode,
+                s_saved,
+                norm_w,
+                norm_eps,
+            )
 
     return mlp_mod(hidden_states)
 

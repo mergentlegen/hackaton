@@ -17,6 +17,17 @@ from .rope import patch_qwen2_rope
 
 def apply() -> None:
     """Install all custom Triton kernel patches and Soup trainer hooks."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     patch_qwen2_rmsnorm()
     patch_qwen2_rope()
     patch_bnb_nf4_linear()
