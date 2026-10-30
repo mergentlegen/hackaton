@@ -3,7 +3,7 @@
 import torch
 
 from .kernels import fused_cross_entropy, silu_mul
-from .attention import pack_rows, qkv_rotate
+from .attention import pack_rows, qkv_rotate, varlen_attention
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .packed_logits import PackedLogits
 from .rmsnorm import rms_norm
@@ -92,16 +92,18 @@ def patch_qwen2_attention():
         if packed is None:  # not the packed training step (packed.py): the original code
             return original(self, hidden_states, position_embeddings, attention_mask,
                             past_key_values, **kwargs)
-        b_idx, t_idx, batch, seq = packed
+        b_idx, t_idx, batch, seq, lengths = packed
         cos, sin = position_embeddings
         config = self.config
+        padded = lengths is None  # not right padded: the padded layout and transformers' mask
         query, key, value = qkv_rotate(self.q_proj(hidden_states), self.k_proj(hidden_states),
                                        self.v_proj(hidden_states), cos, sin, b_idx, t_idx, batch,
                                        seq, config.num_attention_heads,
-                                       config.num_key_value_heads)
+                                       config.num_key_value_heads, padded)
+        if not padded:
+            return self.o_proj(varlen_attention(query, key, value, lengths, self.scaling)), None
         attn = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling,
-            is_causal=attention_mask is None)
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling)
         return self.o_proj(pack_rows(attn, b_idx, t_idx)), None
 
     modeling_qwen2.Qwen2Attention.forward = forward

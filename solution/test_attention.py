@@ -37,8 +37,9 @@ def token_maps(lengths, seq):
     return rows, (rows // seq).to(torch.int32), (rows % seq).to(torch.int32)
 
 
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("lengths,seq", [([64, 37, 50, 12], 64), ([334, 200, 100, 7], 334)])
-def test_qkv_rotate_matches_transformers(lengths, seq):
+def test_qkv_rotate_matches_transformers(lengths, seq, padded):
     from solution.attention import qkv_rotate
 
     torch.manual_seed(0)
@@ -54,23 +55,65 @@ def test_qkv_rotate_matches_transformers(lengths, seq):
     cos, sin = emb.cos()[None], emb.sin()[None]  # (1, T, D) like transformers' rotary_emb
     grads = [torch.randn(batch, heads, seq, dim, device="cuda").half() for _ in range(3)]
 
-    def padded(x):
+    def to_padded(x):
         full = torch.zeros(batch * seq, x.shape[-1], device="cuda")
         return full.index_copy(0, rows, x).view(batch, seq, -1)
 
-    ref = reference(padded(q), padded(k), padded(v), cos.expand(batch, seq, dim),
+    ref = reference(to_padded(q), to_padded(k), to_padded(v), cos.expand(batch, seq, dim),
                     sin.expand(batch, seq, dim), heads, kv_heads)
     torch.autograd.backward(ref, grads)
     ref_grads = [t.grad.clone() for t in (q, k, v)]
     for t in (q, k, v):
         t.grad = None
 
-    out = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, heads, kv_heads)
-    torch.autograd.backward(out, grads)
+    def packed(x):  # (B, H, T, D) -> (N, H, D) rows of the real tokens
+        return x.transpose(1, 2).reshape(batch * seq, heads, dim)[rows]
+
+    out = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, heads, kv_heads, padded)
+    if padded:
+        torch.autograd.backward(out, grads)
+    else:
+        ref = [packed(x) for x in ref]
+        torch.autograd.backward(out, [packed(g) for g in grads])
     for mine, theirs in zip(out, ref):
         torch.testing.assert_close(mine.float(), theirs.float(), rtol=2e-3, atol=2e-3)
     for mine, theirs in zip((q.grad, k.grad, v.grad), ref_grads):
         torch.testing.assert_close(mine, theirs, rtol=2e-3, atol=2e-2)
+
+
+@pytest.mark.parametrize("lengths", [[64, 37, 50, 12], [334, 200, 100, 7]])
+def test_varlen_attention_matches_masked_padded_sdpa(lengths):
+    from solution.attention import varlen_attention
+
+    torch.manual_seed(0)
+    batch, seq, heads, dim = len(lengths), max(lengths), 12, 128
+    rows, _, _ = token_maps(lengths, seq)
+    n = rows.numel()
+    qkv = [torch.randn(n, heads, dim, device="cuda", dtype=torch.float16, requires_grad=True)
+           for _ in range(3)]
+    grad = torch.randn(n, heads * dim, device="cuda", dtype=torch.float16)
+    real = torch.zeros(batch, seq, dtype=torch.bool, device="cuda")
+    for row, length in enumerate(lengths):
+        real[row, :length] = True
+    mask = torch.ones(seq, seq, dtype=torch.bool, device="cuda").tril()[None, None] & real[:, None, None]
+
+    def padded(x):
+        full = torch.zeros(batch * seq, heads, dim, device="cuda", dtype=x.dtype)
+        return full.index_copy(0, rows, x).view(batch, seq, heads, dim).transpose(1, 2)
+
+    ref = torch.nn.functional.scaled_dot_product_attention(*[padded(x) for x in qkv],
+                                                           attn_mask=mask, scale=dim ** -0.5)
+    ref = ref.transpose(1, 2).reshape(batch * seq, heads * dim)[rows]
+    ref.backward(grad)
+    ref_grads = [x.grad.clone() for x in qkv]
+    for x in qkv:
+        x.grad = None
+
+    out = varlen_attention(*qkv, lengths, dim ** -0.5)
+    out.backward(grad)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3)
+    for x, theirs in zip(qkv, ref_grads):
+        torch.testing.assert_close(x.grad.float(), theirs.float(), rtol=1e-2, atol=1e-2)
 
 
 def test_pack_rows_matches_indexing():

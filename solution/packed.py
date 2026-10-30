@@ -7,8 +7,8 @@ explicitly allows removing padding inside a batch (never mixing rows across batc
 
 `Qwen2ForCausalLM.forward` is replaced for the training step: the N real tokens are gathered
 into an (N, hidden) matrix and go through the unchanged decoder layers (they are shape agnostic
-except attention, which gets the token -> (row, position) map and keeps the padded layout only for
-scaled_dot_product_attention, see attention.py). The loss is the same cross-entropy on the same
+except attention, which gets the token -> (row, position) map and the sequence lengths, see
+attention.py). The loss is the same cross-entropy on the same
 rows (padding rows had label -100). The logits TRL and Soup read for their metrics are handed
 over in the padded (B, T, vocab) layout, detached, with zeros at the padding positions, which
 those metrics ignore (attention mask / -100 labels).
@@ -116,19 +116,19 @@ def patch_causal_lm_packed():
         if position_ids is None:
             position_ids = torch.arange(seq, device=device).unsqueeze(0)
         cos, sin = model.rotary_emb(hidden, position_ids)
-        # With padding on the right, a real query never looks at a padding key (those lie in its
-        # future), so causal attention needs no mask at all, and the kernel then skips the whole
-        # upper triangle instead of computing the full (T, T) square under a mask. Padding query
-        # rows differ from transformers' mask, but they are dropped on the way out and get zero
-        # gradient. Any other padding layout keeps transformers' (B, 1, T, T) mask.
+        # With padding on the right, each sequence's real tokens are one contiguous block of the
+        # packed rows, and a real query only ever looks at real keys of its own sequence (the
+        # padding keys lie in its future): attention is plain causal attention of each block on
+        # its own, with no mask and no padding positions at all (attention.varlen_attention).
+        # Any other padding layout keeps the padded layout and transformers' (B, 1, T, T) mask.
         lengths = real.sum(dim=1)
         right_padded = torch.equal(real, torch.arange(seq, device=device)[None, :] < lengths[:, None])
         if right_padded:
-            mask4 = None
+            mask4, row_lengths = None, lengths.tolist()
         else:
             causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
-            mask4 = causal[None, None] & real[:, None, None, :]
-        packed = (b_idx, t_idx, batch, seq)
+            mask4, row_lengths = causal[None, None] & real[:, None, None, :], None
+        packed = (b_idx, t_idx, batch, seq, row_lengths)
         for layer in model.layers[: config.num_hidden_layers]:
             hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
                            position_embeddings=(cos, sin), packed=packed)
@@ -142,7 +142,9 @@ def patch_causal_lm_packed():
             denom = (targets != -100).sum().to(torch.float32)
         else:
             denom = torch.as_tensor(items, device=device, dtype=torch.float32)
-        loss = fused_cross_entropy(logits, targets, denom)
+        # TRL and Soup read the logits for their metrics inside compute_loss, before the backward
+        # pass; the backward then writes the loss gradient over them (no second N x vocab buffer)
+        loss = fused_cross_entropy(logits, targets, denom, inplace_grad=True)
 
         return CausalLMOutputWithPast(loss=loss, logits=PackedLogits(logits.detach(), rows, batch,
                                                                        seq))

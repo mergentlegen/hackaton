@@ -26,30 +26,37 @@ def test_packed_step_matches_original_forward():
     model = Qwen2ForCausalLM._from_config(config, attn_implementation="sdpa").cuda().train()
     lengths = [40, 25, 33]
     ids = torch.randint(0, 1000, (3, 40), device="cuda")
-    mask = torch.zeros(3, 40, dtype=torch.long, device="cuda")
+    right = torch.zeros(3, 40, dtype=torch.long, device="cuda")  # varlen attention path
     for row, length in enumerate(lengths):
-        mask[row, :length] = 1
-    labels = ids.clone()
-    labels[mask == 0] = -100
-    labels[:, :8] = -100
+        right[row, :length] = 1
+    left = right.flip(1)  # padded layout + mask path
 
-    def step():
+    def labels_for(mask):
+        labels = ids.clone()
+        labels[mask == 0] = -100
+        labels[:, :8] = -100
+        return labels
+
+    def step(mask):
         model.zero_grad()
         with torch.autocast("cuda", dtype=torch.float16):
-            out = model(input_ids=ids, attention_mask=mask, labels=labels)
+            out = model(input_ids=ids, attention_mask=mask, labels=labels_for(mask))
+        logits = out.logits.detach().clone()  # read before backward, like TRL and Soup
         out.loss.backward()
         grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
-        return out.loss.detach(), out.logits.detach().clone(), grads
+        return out.loss.detach(), logits, grads
 
-    ref_loss, ref_logits, ref_grads = step()
+    masks = (right, left)
+    refs = [step(mask) for mask in masks]
     solution.apply()
-    loss, logits, grads = step()
-
-    torch.testing.assert_close(loss, ref_loss, rtol=3e-3, atol=3e-3)
-    assert logits.shape == ref_logits.shape == (3, 40, 1000)
-    real = mask.bool()
-    torch.testing.assert_close(logits[real].float(), ref_logits[real].float(), rtol=3e-2, atol=3e-2)
-    assert float(logits[~real].abs().max()) == 0.0  # padding rows are zeros
-    assert set(grads) == set(ref_grads)
-    for name in ref_grads:
-        assert cosine(grads[name], ref_grads[name]) > 0.995, name
+    for mask, (ref_loss, ref_logits, ref_grads) in zip(masks, refs):
+        loss, logits, grads = step(mask)
+        torch.testing.assert_close(loss, ref_loss, rtol=3e-3, atol=3e-3)
+        assert logits.shape == ref_logits.shape == (3, 40, 1000)
+        real = mask.bool()
+        torch.testing.assert_close(logits[real].float(), ref_logits[real].float(), rtol=3e-2,
+                                   atol=3e-2)
+        assert float(logits[~real].abs().max()) == 0.0  # padding rows are zeros
+        assert set(grads) == set(ref_grads)
+        for name in ref_grads:
+            assert cosine(grads[name], ref_grads[name]) > 0.995, name

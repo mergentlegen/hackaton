@@ -150,12 +150,18 @@ def ce_stats(logits, targets, want_entropy):
 
 
 class FusedCrossEntropy(torch.autograd.Function):
-    """sum over rows of (logsumexp - logit[target]) / denom, rows with target < 0 ignored."""
+    """sum over rows of (logsumexp - logit[target]) / denom, rows with target < 0 ignored.
+
+    With `inplace_grad` the gradient is written over the logits themselves (each element is read
+    once and then replaced by its own gradient, so the kernel is safe in place), which saves a
+    second (rows, vocab) buffer at the peak of the step. Only for logits nothing reads after the
+    backward pass."""
 
     @staticmethod
-    def forward(ctx, logits, targets, denom):
+    def forward(ctx, logits, targets, denom, inplace_grad):
         lse, losses, _ = ce_stats(logits, targets, False)
         ctx.save_for_backward(logits, targets, lse, denom)
+        ctx.inplace_grad = inplace_grad
         return losses.sum() / denom
 
     @staticmethod
@@ -163,13 +169,13 @@ class FusedCrossEntropy(torch.autograd.Function):
         logits, targets, lse, denom = ctx.saved_tensors
         rows, vocab = logits.shape
         scale = (grad_output / denom).to(torch.float32).reshape(1)
-        grad = torch.empty_like(logits)
+        grad = logits if ctx.inplace_grad else torch.empty_like(logits)
         ce_backward_kernel[(rows,)](logits, targets, lse, scale, grad, vocab, BLOCK=CE_BLOCK,
                                     num_warps=8)
-        return grad, None, None
+        return grad, None, None, None
 
 
-def fused_cross_entropy(logits, targets, denom):
+def fused_cross_entropy(logits, targets, denom, inplace_grad=False):
     """`logits` (rows, vocab) fp16/fp32, `targets` (rows,) int64 with -100 for ignored rows,
     `denom` a 0-d fp32 tensor on the same device."""
-    return FusedCrossEntropy.apply(logits.contiguous(), targets, denom)
+    return FusedCrossEntropy.apply(logits.contiguous(), targets, denom, inplace_grad)
