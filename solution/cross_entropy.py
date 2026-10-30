@@ -8,23 +8,26 @@ import triton
 import triton.language as tl
 
 IGNORE_INDEX = -100
-DEFAULT_CHUNK_TOKENS = 256
+DEFAULT_CHUNK_TOKENS = 192
 
-# Reusable per-device FP16/BF16/FP32 workspace for chunked [M, V] logits & in-place dlogits
-_LOGITS_WORKSPACE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+# Unified per-device reusable workspace shared by chunked LM head AND stacked NF4 MLP/QKV dequant (~55.6 MiB)
+_SHARED_WORKSPACE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def get_shared_workspace(numel: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    key = (device, dtype)
+    buf = _SHARED_WORKSPACE.get(key)
+    if buf is None or buf.numel() < numel:
+        buf = torch.empty((numel,), dtype=dtype, device=device)
+        _SHARED_WORKSPACE[key] = buf
+    return buf[:numel]
 
 
 def _get_logits_workspace(m: int, v: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    key = (device, dtype)
-    buf = _LOGITS_WORKSPACE.get(key)
-    needed = m * v
-    if buf is None or buf.numel() < needed:
-        buf = torch.empty((needed,), dtype=dtype, device=device)
-        _LOGITS_WORKSPACE[key] = buf
-    return buf[:needed].view(m, v)
+    return get_shared_workspace(m * v, dtype, device).view(m, v)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["with_grad"])
 def triton_fused_chunk_loss_kernel(
     logits_ptr,
     targets_ptr,
@@ -33,7 +36,7 @@ def triton_fused_chunk_loss_kernel(
     hits_out_ptr,
     stride_logits_m,
     vocab_size,
-    WITH_GRAD: tl.constexpr,
+    with_grad,
     BLOCK_V: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -85,7 +88,7 @@ def triton_fused_chunk_loss_kernel(
 
     # Pass 2 (only when gradients are needed): write unscaled dlogits = (p - 1_{target})
     # in-place into logits_row_ptr so values stay in [-1, 1] with zero FP16 underflow!
-    if WITH_GRAD:
+    if with_grad != 0:
         out_ty = logits_ptr.dtype.element_ty
         if is_labelled:
             for start_v in range(0, vocab_size, BLOCK_V):
@@ -135,13 +138,13 @@ class _FusedChunkedHeadLossImpl(torch.autograd.Function):
         w_gemm = weight if weight.dtype == gemm_dtype else weight.to(gemm_dtype)
         h_gemm = hidden_2d if hidden_2d.dtype == gemm_dtype else hidden_2d.to(gemm_dtype)
 
-        with_grad = bool(need_hidden_grad or need_weight_grad)
+        with_grad = 1 if (need_hidden_grad or need_weight_grad) else 0
         loss_all = torch.empty((n_tokens,), dtype=torch.float32, device=device)
         entropy_all = torch.empty((n_tokens,), dtype=torch.float32, device=device)
         hits_all = torch.empty((n_tokens,), dtype=torch.int64, device=device)
 
-        hidden_grad_fp32 = (
-            torch.empty((n_tokens, d), dtype=torch.float32, device=device)
+        hidden_grad_buf = (
+            torch.empty((n_tokens, d), dtype=gemm_dtype, device=device)
             if need_hidden_grad
             else None
         )
@@ -175,15 +178,14 @@ class _FusedChunkedHeadLossImpl(torch.autograd.Function):
                     hits_all[start:stop],
                     logits.stride(0),
                     v,
-                    WITH_GRAD=with_grad,
+                    with_grad,
                     BLOCK_V=BLOCK_V,
                     num_warps=num_warps,
                 )
 
                 if need_hidden_grad:
-                    # logits now holds unscaled dlogits in gemm_dtype
-                    p_grad = torch.matmul(logits, w_gemm)
-                    hidden_grad_fp32[start:stop].copy_(p_grad)
+                    # logits holds unscaled dlogits in [-1, 1]; write matmul directly into slice
+                    torch.matmul(logits, w_gemm, out=hidden_grad_buf[start:stop])
                 if need_weight_grad:
                     weight_grad_fp32.addmm_(logits.t().float(), piece.float())
 
@@ -197,7 +199,7 @@ class _FusedChunkedHeadLossImpl(torch.autograd.Function):
 
         saved = []
         if need_hidden_grad:
-            saved.append(hidden_grad_fp32)
+            saved.append(hidden_grad_buf)
         if need_weight_grad:
             saved.append(weight_grad_fp32)
         saved.append(denom_f32)
@@ -224,7 +226,7 @@ class _FusedChunkedHeadLossImpl(torch.autograd.Function):
         if ctx.need_hidden_grad:
             hg = saved[idx]
             idx += 1
-            d_hidden = (hg * scale).to(ctx.hidden_dtype)
+            d_hidden = (hg.float() * scale).to(ctx.hidden_dtype)
         if ctx.need_weight_grad:
             wg = saved[idx]
             d_weight = (wg * scale).to(ctx.weight_dtype)

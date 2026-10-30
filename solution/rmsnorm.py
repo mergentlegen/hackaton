@@ -1,4 +1,4 @@
-"""Fused RMSNorm and Fused Residual-Add + RMSNorm in Triton (forward & backward)."""
+"""Fused RMSNorm and Fused Residual-Add + RMSNorm in Triton (unified 2-kernel compilation)."""
 
 from __future__ import annotations
 
@@ -7,63 +7,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["has_res"])
 def triton_rmsnorm_fwd(
     x_ptr,
-    y_ptr,
-    w_ptr,
-    r_ptr,
-    stride_x_m,
-    stride_y_m,
-    d_dim,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < d_dim
-
-    x = tl.load(x_ptr + row_idx * stride_x_m + cols, mask=mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / d_dim
-    r = tl.rsqrt(var + eps)
-    tl.store(r_ptr + row_idx, r)
-
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = (x * r) * w
-    tl.store(y_ptr + row_idx * stride_y_m + cols, y.to(y_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def triton_rmsnorm_bwd(
-    dy_ptr,
-    x_ptr,
-    w_ptr,
-    r_ptr,
-    dx_ptr,
-    stride_dy_m,
-    stride_x_m,
-    stride_dx_m,
-    d_dim,
-    BLOCK_SIZE: tl.constexpr,
-):
-    row_idx = tl.program_id(0)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < d_dim
-
-    dy = tl.load(dy_ptr + row_idx * stride_dy_m + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(x_ptr + row_idx * stride_x_m + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    r = tl.load(r_ptr + row_idx).to(tl.float32)
-
-    s = dy * w
-    dot = tl.sum(s * x, axis=0)
-    dx = r * (s - x * (r * r * dot / d_dim))
-    tl.store(dx_ptr + row_idx * stride_dx_m + cols, dx.to(dx_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def triton_fused_add_rmsnorm_fwd(
-    res_ptr,
     delta_ptr,
     s_out_ptr,
     y_out_ptr,
@@ -72,6 +18,7 @@ def triton_fused_add_rmsnorm_fwd(
     stride_m,
     d_dim,
     eps,
+    has_res,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -79,23 +26,24 @@ def triton_fused_add_rmsnorm_fwd(
     mask = cols < d_dim
     base = row_idx * stride_m + cols
 
-    res = tl.load(res_ptr + base, mask=mask, other=0.0).to(tl.float32)
-    delta = tl.load(delta_ptr + base, mask=mask, other=0.0).to(tl.float32)
-    s_typed = (res + delta).to(s_out_ptr.dtype.element_ty)
-    tl.store(s_out_ptr + base, s_typed, mask=mask)
+    x = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
+    if has_res != 0:
+        delta = tl.load(delta_ptr + base, mask=mask, other=0.0).to(tl.float32)
+        s_typed = (x + delta).to(s_out_ptr.dtype.element_ty)
+        tl.store(s_out_ptr + base, s_typed, mask=mask)
+        x = s_typed.to(tl.float32)
 
-    s = s_typed.to(tl.float32)
-    var = tl.sum(s * s, axis=0) / d_dim
+    var = tl.sum(x * x, axis=0) / d_dim
     r = tl.rsqrt(var + eps)
     tl.store(r_ptr + row_idx, r)
 
     w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    y = (s * r) * w
+    y = (x * r) * w
     tl.store(y_out_ptr + base, y.to(y_out_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
-def triton_fused_add_rmsnorm_bwd(
+@triton.jit(do_not_specialize=["has_gs"])
+def triton_rmsnorm_bwd(
     gs_ptr,
     gy_ptr,
     s_ptr,
@@ -104,7 +52,7 @@ def triton_fused_add_rmsnorm_bwd(
     din_ptr,
     stride_m,
     d_dim,
-    HAS_GS: tl.constexpr,
+    has_gs,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -120,7 +68,7 @@ def triton_fused_add_rmsnorm_bwd(
     sw = gy * w
     dot = tl.sum(sw * s, axis=0)
     din = r * (sw - s * (r * r * dot / d_dim))
-    if HAS_GS:
+    if has_gs != 0:
         gs = tl.load(gs_ptr + base, mask=mask, other=0.0).to(tl.float32)
         din = din + gs
 
@@ -131,6 +79,37 @@ def _norm_launch_cfg(d: int) -> tuple[int, int]:
     block = triton.next_power_of_2(d)
     warps = 8 if block >= 2048 else (4 if block >= 512 else 2)
     return block, warps
+
+
+def rmsnorm_nograd_2d(
+    x_2d: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    r_buf: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fast no-autograd 2D RMSNorm used during selective MLP recomputation."""
+    m, d = x_2d.shape
+    y_2d = torch.empty_like(x_2d)
+    if m == 0:
+        return y_2d
+    if r_buf is None:
+        r_buf = torch.empty((m,), dtype=torch.float32, device=x_2d.device)
+    block, warps = _norm_launch_cfg(d)
+    triton_rmsnorm_fwd[(m,)](
+        x_2d,
+        x_2d,
+        y_2d,
+        y_2d,
+        weight,
+        r_buf,
+        x_2d.stride(0),
+        d,
+        eps,
+        0,
+        BLOCK_SIZE=block,
+        num_warps=warps,
+    )
+    return y_2d
 
 
 class TritonRMSNormFunc(torch.autograd.Function):
@@ -152,13 +131,15 @@ class TritonRMSNormFunc(torch.autograd.Function):
         block, warps = _norm_launch_cfg(d)
         triton_rmsnorm_fwd[(m,)](
             x_2d,
+            x_2d,
+            y_2d,
             y_2d,
             weight,
             r,
             x_2d.stride(0),
-            y_2d.stride(0),
             d,
             eps,
+            0,
             BLOCK_SIZE=block,
             num_warps=warps,
         )
@@ -179,14 +160,14 @@ class TritonRMSNormFunc(torch.autograd.Function):
             block, warps = _norm_launch_cfg(d)
             triton_rmsnorm_bwd[(m,)](
                 grad_2d,
+                grad_2d,
                 x_2d,
                 weight,
                 r,
                 dx_2d,
-                grad_2d.stride(0),
                 x_2d.stride(0),
-                dx_2d.stride(0),
                 d,
+                0,
                 BLOCK_SIZE=block,
                 num_warps=warps,
             )
@@ -214,7 +195,7 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
 
         if m > 0:
             block, warps = _norm_launch_cfg(d)
-            triton_fused_add_rmsnorm_fwd[(m,)](
+            triton_rmsnorm_fwd[(m,)](
                 res_2d,
                 del_2d,
                 s_2d,
@@ -224,6 +205,7 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
                 res_2d.stride(0),
                 d,
                 eps,
+                1,
                 BLOCK_SIZE=block,
                 num_warps=warps,
             )
@@ -249,13 +231,13 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
             return d_res, d_del, None, None
 
         gy_2d = grad_y.reshape(-1, d).contiguous()
-        has_gs = grad_s is not None
+        has_gs = 1 if grad_s is not None else 0
         gs_2d = grad_s.reshape(-1, d).contiguous() if has_gs else gy_2d
         din_2d = torch.empty_like(s_2d)
 
         if m > 0:
             block, warps = _norm_launch_cfg(d)
-            triton_fused_add_rmsnorm_bwd[(m,)](
+            triton_rmsnorm_bwd[(m,)](
                 gs_2d,
                 gy_2d,
                 s_2d,
@@ -264,7 +246,7 @@ class TritonFusedAddRMSNormFunc(torch.autograd.Function):
                 din_2d,
                 s_2d.stride(0),
                 d,
-                HAS_GS=has_gs,
+                has_gs,
                 BLOCK_SIZE=block,
                 num_warps=warps,
             )

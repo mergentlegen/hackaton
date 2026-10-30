@@ -211,63 +211,16 @@ def test_chunked_cross_entropy_matches_pytorch():
     assert hits.item() == ref_hits.item()
 
 
-def test_sm75_shared_memory_and_rule_compliance():
-    """Verify AST check passes with 0 lookalikes/banned imports and all compiled kernels fit well within SM75 64KB smem."""
-    import sys
-    from pathlib import Path
-
-    repo = Path(__file__).resolve().parents[1]
-    if str(repo / "harness") not in sys.path:
-        sys.path.insert(0, str(repo / "harness"))
-
-    from check_rules import source_kernels
-    from common import SOLUTION_DIR
-
-    own, _copies, lookalikes, banned, broken = source_kernels(SOLUTION_DIR)
-    assert len(own) >= 6
-    assert lookalikes == []
-    assert banned == []
-    assert broken == []
-
-    from solution.cross_entropy import triton_fused_chunk_loss_kernel
-    from solution.nf4_linear import triton_nf4_dequant_kernel
-    from solution.rmsnorm import (
-        triton_fused_add_rmsnorm_bwd,
-        triton_fused_add_rmsnorm_fwd,
-        triton_rmsnorm_bwd,
-        triton_rmsnorm_fwd,
-    )
-    from solution.rope import triton_qk_rope_bwd, triton_qk_rope_fwd
-
-    for jit_fn in [
-        triton_fused_chunk_loss_kernel,
-        triton_nf4_dequant_kernel,
-        triton_rmsnorm_fwd,
-        triton_rmsnorm_bwd,
-        triton_fused_add_rmsnorm_fwd,
-        triton_fused_add_rmsnorm_bwd,
-        triton_qk_rope_fwd,
-        triton_qk_rope_bwd,
-    ]:
-        for dev_cache in jit_fn.device_caches.values():
-            cache_dict = dev_cache[0] if isinstance(dev_cache, tuple) else dev_cache
-            for compiled in cache_dict.values():
-                meta = getattr(compiled, "metadata", None)
-                smem = int(getattr(meta, "shared", 0)) if meta is not None else 0
-                assert smem <= SM75_MAX_SHARED_MEM_BYTES // 4, (
-                    f"{jit_fn.fn.__name__} uses {smem} bytes shared memory"
-                )
-
-
 def test_packed_checkpointed_decoder_layer_lora_parity():
-    """End-to-end parity check of unpadded batch compaction + custom decoder checkpointing
-    + NF4 SwiGLU MLP + clone-free addmm LoRA (non-zero lora_A & lora_B) + chunked loss."""
+    """End-to-end parity check of unpadded batch compaction + selective attention checkpointing
+    + fused QKV + packed NF4 SwiGLU MLP + clone-free addmm LoRA + chunked loss."""
     import copy
     import bitsandbytes as bnb
     from peft import LoraConfig, get_peft_model
     from transformers import Qwen2Config, Qwen2ForCausalLM
 
     import solution
+    import solution.padding as pad_mod
     from solution.cross_entropy import TritonChunkedCausalLMLoss
     from solution.padding import install_model_layer_optimizations
 
@@ -299,7 +252,7 @@ def test_packed_checkpointed_decoder_layer_lora_parity():
         vocab_size=4096,
         hidden_size=256,
         intermediate_size=640,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         num_attention_heads=4,
         num_key_value_heads=2,
         max_position_embeddings=256,
@@ -314,7 +267,6 @@ def test_packed_checkpointed_decoder_layer_lora_parity():
 
     lora_cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.0, target_modules=["q_proj", "v_proj"])
     ref_model = get_peft_model(base_raw, lora_cfg)
-    # Initialize lora_B non-zero so BOTH lora_A.grad and lora_B.grad are exercised!
     for n, p in ref_model.named_parameters():
         if "lora_B" in n:
             torch.nn.init.normal_(p, std=0.02)
@@ -339,9 +291,15 @@ def test_packed_checkpointed_decoder_layer_lora_parity():
     causal_lm = sol_model.base_model.model
     install_model_layer_optimizations(causal_lm)
     hook = TritonChunkedCausalLMLoss(causal_lm, chunk_tokens=128)
-    with torch.amp.autocast("cuda", dtype=torch.float16):
-        sol_out = sol_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-    (sol_out.loss * 1024.0).backward()
+    orig_budget = pad_mod._ATTN_UNCKPT_BUDGET_MIB
+    try:
+        # Force both uncheckpointed (layer 0) and checkpointed (layers 1..3) paths to execute
+        pad_mod._ATTN_UNCKPT_BUDGET_MIB = 0.001
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            sol_out = sol_model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        (sol_out.loss * 1024.0).backward()
+    finally:
+        pad_mod._ATTN_UNCKPT_BUDGET_MIB = orig_budget
     step_info = hook.take_step()
 
     assert step_info is not None
@@ -356,4 +314,48 @@ def test_packed_checkpointed_decoder_layer_lora_parity():
                 p_sol.grad.flatten().float(), p_ref.grad.flatten().float(), dim=0
             ).item()
             assert cos > 0.999, f"Low grad cosine similarity on {name}: {cos}"
+
+
+def test_sm75_shared_memory_and_rule_compliance():
+    """Verify AST check passes with 0 lookalikes/banned imports and all compiled kernels fit well within SM75 64KB smem."""
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    if str(repo / "harness") not in sys.path:
+        sys.path.insert(0, str(repo / "harness"))
+
+    from check_rules import source_kernels
+    from common import SOLUTION_DIR
+
+    own, _copies, lookalikes, banned, broken = source_kernels(SOLUTION_DIR)
+    assert len(own) >= 6
+    assert lookalikes == []
+    assert banned == []
+    assert broken == []
+
+    from solution.cross_entropy import triton_fused_chunk_loss_kernel
+    from solution.nf4_linear import (
+        triton_nf4_dequant_kernel,
+        triton_swiglu_packed_kernel,
+    )
+    from solution.rmsnorm import triton_rmsnorm_bwd, triton_rmsnorm_fwd
+    from solution.rope import triton_qk_rope_kernel
+
+    for jit_fn in [
+        triton_fused_chunk_loss_kernel,
+        triton_nf4_dequant_kernel,
+        triton_swiglu_packed_kernel,
+        triton_rmsnorm_fwd,
+        triton_rmsnorm_bwd,
+        triton_qk_rope_kernel,
+    ]:
+        for dev_cache in jit_fn.device_caches.values():
+            cache_dict = dev_cache[0] if isinstance(dev_cache, tuple) else dev_cache
+            for compiled in cache_dict.values():
+                meta = getattr(compiled, "metadata", None)
+                smem = int(getattr(meta, "shared", 0)) if meta is not None else 0
+                assert smem <= SM75_MAX_SHARED_MEM_BYTES // 4, (
+                    f"{jit_fn.fn.__name__} uses {smem} bytes shared memory"
+                )
 

@@ -1,4 +1,4 @@
-"""Zero-copy stride-native Fused Q+K Rotary Position Embedding (RoPE) in Triton."""
+"""Zero-copy stride-native Fused Q+K Rotary Position Embedding (RoPE) in Triton (single-kernel compilation)."""
 
 from __future__ import annotations
 
@@ -7,20 +7,26 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
-def triton_qk_rope_fwd(
-    q_ptr,
-    k_ptr,
+@triton.jit(do_not_specialize=["seq_len", "h_q", "has_q", "has_k", "is_bwd"])
+def triton_qk_rope_kernel(
+    q_in_ptr,
+    k_in_ptr,
     cos_ptr,
     sin_ptr,
     q_out_ptr,
     k_out_ptr,
-    stride_qb,
-    stride_qh,
-    stride_qs,
-    stride_kb,
-    stride_kh,
-    stride_ks,
+    stride_qib,
+    stride_qih,
+    stride_qis,
+    stride_qob,
+    stride_qoh,
+    stride_qos,
+    stride_kib,
+    stride_kih,
+    stride_kis,
+    stride_kob,
+    stride_koh,
+    stride_kos,
     stride_cos_b,
     stride_cos_s,
     stride_sin_b,
@@ -28,7 +34,9 @@ def triton_qk_rope_fwd(
     seq_len,
     h_q,
     half_dim,
-    HAS_K: tl.constexpr,
+    has_q,
+    has_k,
+    is_bwd,
     BLOCK_HALF: tl.constexpr,
 ):
     pid_bs = tl.program_id(0)
@@ -49,98 +57,38 @@ def triton_qk_rope_fwd(
     s2 = tl.load(sin_row + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
 
     if pid_h < h_q:
-        off = b_idx * stride_qb + pid_h * stride_qh + s_idx * stride_qs
-        x1 = tl.load(q_ptr + off + cols, mask=mask, other=0.0).to(tl.float32)
-        x2 = tl.load(q_ptr + off + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
-        y1 = x1 * c1 - x2 * s1
-        y2 = x2 * c2 + x1 * s2
-        tl.store(q_out_ptr + off + cols, y1.to(q_out_ptr.dtype.element_ty), mask=mask)
-        tl.store(q_out_ptr + off + half_dim + cols, y2.to(q_out_ptr.dtype.element_ty), mask=mask)
-    elif HAS_K:
+        if has_q != 0:
+            ioff = b_idx * stride_qib + pid_h * stride_qih + s_idx * stride_qis
+            ooff = b_idx * stride_qob + pid_h * stride_qoh + s_idx * stride_qos
+            x1 = tl.load(q_in_ptr + ioff + cols, mask=mask, other=0.0).to(tl.float32)
+            x2 = tl.load(q_in_ptr + ioff + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
+            if is_bwd == 0:
+                y1 = x1 * c1 - x2 * s1
+                y2 = x2 * c2 + x1 * s2
+            else:
+                y1 = x1 * c1 + x2 * s2
+                y2 = x2 * c2 - x1 * s1
+            tl.store(q_out_ptr + ooff + cols, y1.to(q_out_ptr.dtype.element_ty), mask=mask)
+            tl.store(q_out_ptr + ooff + half_dim + cols, y2.to(q_out_ptr.dtype.element_ty), mask=mask)
+    elif has_k != 0:
         kh = pid_h - h_q
-        off = b_idx * stride_kb + kh * stride_kh + s_idx * stride_ks
-        x1 = tl.load(k_ptr + off + cols, mask=mask, other=0.0).to(tl.float32)
-        x2 = tl.load(k_ptr + off + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
-        y1 = x1 * c1 - x2 * s1
-        y2 = x2 * c2 + x1 * s2
-        tl.store(k_out_ptr + off + cols, y1.to(k_out_ptr.dtype.element_ty), mask=mask)
-        tl.store(k_out_ptr + off + half_dim + cols, y2.to(k_out_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.jit
-def triton_qk_rope_bwd(
-    gq_ptr,
-    gk_ptr,
-    cos_ptr,
-    sin_ptr,
-    dq_ptr,
-    dk_ptr,
-    stride_gqb,
-    stride_gqh,
-    stride_gqs,
-    stride_dqb,
-    stride_dqh,
-    stride_dqs,
-    stride_gkb,
-    stride_gkh,
-    stride_gks,
-    stride_dkb,
-    stride_dkh,
-    stride_dks,
-    stride_cos_b,
-    stride_cos_s,
-    stride_sin_b,
-    stride_sin_s,
-    seq_len,
-    h_q,
-    half_dim,
-    HAS_GQ: tl.constexpr,
-    HAS_GK: tl.constexpr,
-    BLOCK_HALF: tl.constexpr,
-):
-    pid_bs = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    b_idx = pid_bs // seq_len
-    s_idx = pid_bs % seq_len
-
-    cols = tl.arange(0, BLOCK_HALF)
-    mask = cols < half_dim
-
-    cos_row = cos_ptr + b_idx * stride_cos_b + s_idx * stride_cos_s
-    sin_row = sin_ptr + b_idx * stride_sin_b + s_idx * stride_sin_s
-
-    c1 = tl.load(cos_row + cols, mask=mask, other=1.0).to(tl.float32)
-    c2 = tl.load(cos_row + half_dim + cols, mask=mask, other=1.0).to(tl.float32)
-    s1 = tl.load(sin_row + cols, mask=mask, other=0.0).to(tl.float32)
-    s2 = tl.load(sin_row + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
-
-    if pid_h < h_q:
-        if HAS_GQ:
-            goff = b_idx * stride_gqb + pid_h * stride_gqh + s_idx * stride_gqs
-            doff = b_idx * stride_dqb + pid_h * stride_dqh + s_idx * stride_dqs
-            g1 = tl.load(gq_ptr + goff + cols, mask=mask, other=0.0).to(tl.float32)
-            g2 = tl.load(gq_ptr + goff + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
-            dx1 = g1 * c1 + g2 * s2
-            dx2 = g2 * c2 - g1 * s1
-            tl.store(dq_ptr + doff + cols, dx1.to(dq_ptr.dtype.element_ty), mask=mask)
-            tl.store(dq_ptr + doff + half_dim + cols, dx2.to(dq_ptr.dtype.element_ty), mask=mask)
-    elif HAS_GK:
-        kh = pid_h - h_q
-        goff = b_idx * stride_gkb + kh * stride_gkh + s_idx * stride_gks
-        doff = b_idx * stride_dkb + kh * stride_dkh + s_idx * stride_dks
-        g1 = tl.load(gk_ptr + goff + cols, mask=mask, other=0.0).to(tl.float32)
-        g2 = tl.load(gk_ptr + goff + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
-        dx1 = g1 * c1 + g2 * s2
-        dx2 = g2 * c2 - g1 * s1
-        tl.store(dk_ptr + doff + cols, dx1.to(dk_ptr.dtype.element_ty), mask=mask)
-        tl.store(dk_ptr + doff + half_dim + cols, dx2.to(dk_ptr.dtype.element_ty), mask=mask)
+        ioff = b_idx * stride_kib + kh * stride_kih + s_idx * stride_kis
+        ooff = b_idx * stride_kob + kh * stride_koh + s_idx * stride_kos
+        x1 = tl.load(k_in_ptr + ioff + cols, mask=mask, other=0.0).to(tl.float32)
+        x2 = tl.load(k_in_ptr + ioff + half_dim + cols, mask=mask, other=0.0).to(tl.float32)
+        if is_bwd == 0:
+            y1 = x1 * c1 - x2 * s1
+            y2 = x2 * c2 + x1 * s2
+        else:
+            y1 = x1 * c1 + x2 * s2
+            y2 = x2 * c2 - x1 * s1
+        tl.store(k_out_ptr + ooff + cols, y1.to(k_out_ptr.dtype.element_ty), mask=mask)
+        tl.store(k_out_ptr + ooff + half_dim + cols, y2.to(k_out_ptr.dtype.element_ty), mask=mask)
 
 
 def _normalize_cos_sin(t: torch.Tensor, seq_len: int, d: int) -> tuple[torch.Tensor, int, int]:
     """Return a 3D view (B_or_1, S, D) with stride(-1) == 1 and (stride_b, stride_s)."""
     if t.ndim == 4:
-        # Either (B, 1, S, D) or (B, S, 1, D)
         if t.shape[1] == 1:
             t3 = t.squeeze(1)
         elif t.shape[2] == 1:
@@ -166,6 +114,8 @@ def _ensure_last_contig(x: torch.Tensor) -> torch.Tensor:
 
 
 class TritonFusedQKRoPEFunc(torch.autograd.Function):
+    """BHSD-convention (B, H, S, D) Fused Q+K RoPE."""
+
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         q = _ensure_last_contig(q)
@@ -183,7 +133,7 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
-            triton_qk_rope_fwd[(b * s, h_q + h_k)](
+            triton_qk_rope_kernel[(b * s, h_q + h_k)](
                 q,
                 k,
                 cos_3d,
@@ -193,9 +143,15 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
                 q.stride(0),
                 q.stride(1),
                 q.stride(2),
+                q_out.stride(0),
+                q_out.stride(1),
+                q_out.stride(2),
                 k.stride(0),
                 k.stride(1),
                 k.stride(2),
+                k_out.stride(0),
+                k_out.stride(1),
+                k_out.stride(2),
                 sc_b,
                 sc_s,
                 ss_b,
@@ -203,7 +159,9 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
                 s,
                 h_q,
                 half_dim,
-                HAS_K=True,
+                1,
+                1,
+                0,
                 BLOCK_HALF=block_half,
                 num_warps=warps,
             )
@@ -261,7 +219,7 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
-            triton_qk_rope_bwd[(b * s, h_q + (h_k if need_k else 0))](
+            triton_qk_rope_kernel[(b * s, h_q + (h_k if need_k else 0))](
                 gq,
                 gk,
                 cos_3d,
@@ -287,8 +245,124 @@ class TritonFusedQKRoPEFunc(torch.autograd.Function):
                 s,
                 h_q,
                 half_dim,
-                HAS_GQ=need_q,
-                HAS_GK=need_k,
+                1 if need_q else 0,
+                1 if need_k else 0,
+                1,
+                BLOCK_HALF=block_half,
+                num_warps=warps,
+            )
+
+        return (dq if need_q else None), (dk if need_k else None), None, None
+
+
+class TritonFusedQKRoPEBSHDFunc(torch.autograd.Function):
+    """Zero-transpose BSHD-convention (B, S, H, D) Fused Q+K RoPE outputting contiguous (B, S, H, D)."""
+
+    @staticmethod
+    def forward(ctx, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        q = _ensure_last_contig(q)
+        k = _ensure_last_contig(k)
+        b, s, h_q, d = q.shape
+        h_k = k.shape[2]
+        half_dim = d // 2
+
+        q_out = torch.empty((b, s, h_q, d), device=q.device, dtype=q.dtype)
+        k_out = torch.empty((b, s, h_k, d), device=k.device, dtype=k.dtype)
+
+        cos_3d, sc_b, sc_s = _normalize_cos_sin(cos, s, d)
+        sin_3d, ss_b, ss_s = _normalize_cos_sin(sin, s, d)
+
+        if b * s > 0:
+            block_half = triton.next_power_of_2(half_dim)
+            warps = 2 if block_half <= 64 else 4
+            # In BSHD: stride_b = stride(0), stride_h = stride(2), stride_s = stride(1)
+            triton_qk_rope_kernel[(b * s, h_q + h_k)](
+                q,
+                k,
+                cos_3d,
+                sin_3d,
+                q_out,
+                k_out,
+                q.stride(0),
+                q.stride(2),
+                q.stride(1),
+                q_out.stride(0),
+                q_out.stride(2),
+                q_out.stride(1),
+                k.stride(0),
+                k.stride(2),
+                k.stride(1),
+                k_out.stride(0),
+                k_out.stride(2),
+                k_out.stride(1),
+                sc_b,
+                sc_s,
+                ss_b,
+                ss_s,
+                s,
+                h_q,
+                half_dim,
+                1,
+                1,
+                0,
+                BLOCK_HALF=block_half,
+                num_warps=warps,
+            )
+
+        ctx.save_for_backward(cos_3d, sin_3d)
+        ctx.meta = (b, s, h_q, h_k, d, q.dtype, k.dtype, sc_b, sc_s, ss_b, ss_s)
+        ctx.set_materialize_grads(False)
+        return q_out, k_out
+
+    @staticmethod
+    def backward(ctx, grad_q: torch.Tensor | None, grad_k: torch.Tensor | None):
+        cos_3d, sin_3d = ctx.saved_tensors
+        b, s, h_q, h_k, d, q_dtype, k_dtype, sc_b, sc_s, ss_b, ss_s = ctx.meta
+        half_dim = d // 2
+
+        need_q = ctx.needs_input_grad[0] and grad_q is not None
+        need_k = ctx.needs_input_grad[1] and grad_k is not None
+        if not need_q and not need_k:
+            return None, None, None, None
+
+        gq = _ensure_last_contig(grad_q) if need_q else cos_3d
+        gk = _ensure_last_contig(grad_k) if need_k else cos_3d
+
+        dq = torch.empty((b, s, h_q, d), device=cos_3d.device, dtype=q_dtype) if need_q else cos_3d
+        dk = torch.empty((b, s, h_k, d), device=cos_3d.device, dtype=k_dtype) if need_k else cos_3d
+
+        if b * s > 0:
+            block_half = triton.next_power_of_2(half_dim)
+            warps = 2 if block_half <= 64 else 4
+            triton_qk_rope_kernel[(b * s, h_q + (h_k if need_k else 0))](
+                gq,
+                gk,
+                cos_3d,
+                sin_3d,
+                dq,
+                dk,
+                gq.stride(0) if need_q else 0,
+                gq.stride(2) if need_q else 0,
+                gq.stride(1) if need_q else 0,
+                dq.stride(0) if need_q else 0,
+                dq.stride(2) if need_q else 0,
+                dq.stride(1) if need_q else 0,
+                gk.stride(0) if need_k else 0,
+                gk.stride(2) if need_k else 0,
+                gk.stride(1) if need_k else 0,
+                dk.stride(0) if need_k else 0,
+                dk.stride(2) if need_k else 0,
+                dk.stride(1) if need_k else 0,
+                sc_b,
+                sc_s,
+                ss_b,
+                ss_s,
+                s,
+                h_q,
+                half_dim,
+                1 if need_q else 0,
+                1 if need_k else 0,
+                1,
                 BLOCK_HALF=block_half,
                 num_warps=warps,
             )
@@ -309,7 +383,7 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
-            triton_qk_rope_fwd[(b * s, h)](
+            triton_qk_rope_kernel[(b * s, h)](
                 x,
                 x,
                 cos_3d,
@@ -319,6 +393,12 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
                 x.stride(0),
                 x.stride(1),
                 x.stride(2),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                0,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -329,7 +409,9 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
                 s,
                 h,
                 half_dim,
-                HAS_K=False,
+                1,
+                0,
+                0,
                 BLOCK_HALF=block_half,
                 num_warps=warps,
             )
@@ -349,7 +431,7 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
         if b * s > 0:
             block_half = triton.next_power_of_2(half_dim)
             warps = 2 if block_half <= 64 else 4
-            triton_qk_rope_bwd[(b * s, h)](
+            triton_qk_rope_kernel[(b * s, h)](
                 gq,
                 gq,
                 cos_3d,
@@ -375,8 +457,9 @@ class TritonSingleRoPEFunc(torch.autograd.Function):
                 s,
                 h,
                 half_dim,
-                HAS_GQ=True,
-                HAS_GK=False,
+                1,
+                0,
+                1,
                 BLOCK_HALF=block_half,
                 num_warps=warps,
             )
@@ -391,6 +474,12 @@ def fused_qk_rope(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return TritonFusedQKRoPEFunc.apply(q, k, cos, sin)
+
+
+def fused_qk_rope_bshd(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return TritonFusedQKRoPEBSHDFunc.apply(q, k, cos, sin)
 
 
 def patch_qwen2_rope() -> None:
