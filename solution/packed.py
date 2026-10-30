@@ -136,12 +136,14 @@ def patch_causal_lm_packed():
             causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
             mask4, row_lengths = causal[None, None] & real[:, None, None, :], None
         packed = (b_idx, t_idx, batch, seq, row_lengths)
-        OFFLOADER.begin(device)  # MLP and norm activations to pinned host memory (offload.py)
+        # what the layers keep for the backward goes to pinned host memory (offload.py)
+        OFFLOADER.begin(device)
         try:
-            for layer in model.layers[: config.num_hidden_layers]:
-                hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
-                               position_embeddings=(cos, sin), packed=packed)
-            hidden = model.norm(hidden)
+            with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
+                for layer in model.layers[: config.num_hidden_layers]:
+                    hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
+                                   position_embeddings=(cos, sin), packed=packed)
+                hidden = model.norm(hidden)
         finally:
             OFFLOADER.end()
         logits = self.lm_head(hidden)  # (N, vocab), fp16 under autocast

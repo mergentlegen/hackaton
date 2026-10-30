@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .offload import OFFLOADER
+
 
 @triton.jit(do_not_specialize=["seq", "scb", "sct", "layout"])
 def qkv_forward_kernel(q_ptr, k_ptr, v_ptr, cos_ptr, sin_ptr, b_ptr, t_ptr, qo_ptr, ko_ptr,
@@ -191,6 +193,49 @@ def varlen_attention(query, key, value, lengths, scale):
             dropout_p=0.0, is_causal=True, scale=scale)
         outputs.append(out[0].transpose(0, 1).reshape(q.shape[0], -1))
     return torch.cat(outputs)
+
+
+def _attend(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale):
+    query, key, value = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, 0, seq, heads, kv_heads)
+    return varlen_attention(query, key, value, lengths, scale)
+
+
+class PackedAttention(torch.autograd.Function):
+    """Rotation + per-sequence causal attention of the packed rows, (N, heads * D) fp16 out.
+
+    Keeps only the three projections (2048 fp16 values per token: pre-rotation, k and v not yet
+    repeated for GQA) for the backward, in pinned host memory when `offload`; the backward
+    recomputes the rotation and the attention forward (about 1% of the step) and differentiates
+    them. Without this, autograd keeps the rotated q, the 6x repeated k and v, the attention
+    output and its log-sum-exp on the GPU: 3x the bytes."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale,
+                offload):
+        with torch.no_grad():
+            out = _attend(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale)
+        ctx.consts = (cos, sin, b_idx, t_idx)  # small, and shared by all layers
+        ctx.meta = (seq, heads, kv_heads, lengths, scale)
+        if offload:
+            ctx.item = OFFLOADER.save(q, k, v)
+        else:
+            ctx.save_for_backward(q, k, v)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v = OFFLOADER.load(ctx.item) if hasattr(ctx, "item") else ctx.saved_tensors
+        inputs = [t.detach().requires_grad_() for t in (q, k, v)]
+        with torch.enable_grad():
+            out = _attend(*inputs, *ctx.consts, *ctx.meta)
+        grads = torch.autograd.grad(out, inputs, dout)
+        return (*grads, None, None, None, None, None, None, None, None, None, None)
+
+
+def packed_attention(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale):
+    offload = OFFLOADER.wants(q, k, v) and (q.requires_grad or k.requires_grad or v.requires_grad)
+    return PackedAttention.apply(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths,
+                                 scale, offload)
 
 
 @triton.jit(do_not_specialize=["seq", "mode"])

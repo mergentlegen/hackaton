@@ -3,7 +3,7 @@
 import torch
 
 from .kernels import fused_cross_entropy, silu_mul
-from .attention import pack_rows, qkv_rotate, varlen_attention
+from .attention import pack_rows, packed_attention, qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .packed_logits import PackedLogits
 from .rmsnorm import rms_norm
@@ -95,13 +95,17 @@ def patch_qwen2_attention():
         b_idx, t_idx, batch, seq, lengths = packed
         cos, sin = position_embeddings
         config = self.config
-        padded = lengths is None  # not right padded: the padded layout and transformers' mask
-        query, key, value = qkv_rotate(self.q_proj(hidden_states), self.k_proj(hidden_states),
-                                       self.v_proj(hidden_states), cos, sin, b_idx, t_idx, batch,
-                                       seq, config.num_attention_heads,
-                                       config.num_key_value_heads, padded)
-        if not padded:
-            return self.o_proj(varlen_attention(query, key, value, lengths, self.scaling)), None
+        q, k, v = (self.q_proj(hidden_states), self.k_proj(hidden_states),
+                   self.v_proj(hidden_states))
+        if lengths is not None:  # right padded: per-sequence attention on the packed rows
+            attn = packed_attention(q, k, v, cos, sin, b_idx, t_idx, seq,
+                                    config.num_attention_heads, config.num_key_value_heads,
+                                    lengths, self.scaling)
+            return self.o_proj(attn), None
+        # otherwise the padded layout and transformers' mask
+        query, key, value = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq,
+                                       config.num_attention_heads, config.num_key_value_heads,
+                                       True)
         attn = torch.nn.functional.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling)
         return self.o_proj(pack_rows(attn, b_idx, t_idx)), None
