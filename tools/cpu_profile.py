@@ -51,7 +51,14 @@ def main():
                 torch.cuda.synchronize()
                 profile.disable()
                 control.should_training_stop = True
-                for order, rows in (("tottime", 38), ("cumulative", 30)):
+                for pattern in ("'item'", "named_modules", "acquire", "commit", "wait"):
+                    out = io.StringIO()
+                    pstats.Stats(profile, stream=out).sort_stats("tottime").print_callers(pattern)
+                    lines = [line for line in out.getvalue().splitlines() if line.strip()]
+                    print(f"CPUPROF ---- callers of {pattern}")
+                    for line in lines[2:14]:
+                        print("CPUPROF", line[:200])
+                for order, rows in (("tottime", 12),):
                     out = io.StringIO()
                     stats = pstats.Stats(profile, stream=out).sort_stats(order)
                     stats.print_stats(rows)
