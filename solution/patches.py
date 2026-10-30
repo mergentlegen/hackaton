@@ -190,3 +190,56 @@ def patch_trainer_flops():
         return 6 * inputs[name].numel() * params
 
     transformers.Trainer.floating_point_ops = floating_point_ops
+
+
+def _fp16_table(weight):
+    """`weight`'s values as an fp16 tensor if they are all exactly representable, else None."""
+    if weight.dtype == torch.float16:
+        return weight.data
+    half = weight.data.to(torch.float16)
+    for i in range(0, half.shape[0], 16384):
+        if not torch.equal(half[i:i + 16384].to(weight.dtype), weight.data[i:i + 16384]):
+            return None
+    return half
+
+
+def patch_kbit_preparation():
+    """peft's prepare_model_for_kbit_training (Soup calls it for the 4-bit model) casts every
+    fp16 weight to fp32, the frozen embedding table too: while it does, the fp16 table (467 MiB)
+    and its fp32 copy (934 MiB) are both on the GPU, the highest point of the whole run once the
+    training step is lean (offload.py, lm_loss.py). The packed step stores that table as fp16
+    again anyway (packed.py, `_fp16_embeddings`: every value is exact in fp16), so the table is
+    set aside during the call and put back as the same fp16 values, frozen like peft leaves every
+    base weight. Anything that is not an exactly-fp16 table on a GPU goes through peft as is."""
+    import peft
+
+    original = peft.prepare_model_for_kbit_training
+
+    def prepare(model, *args, **kwargs):
+        aside = []
+        for get in ("get_input_embeddings", "get_output_embeddings"):
+            module = getattr(model, get, lambda: None)()
+            weight = getattr(module, "weight", None)
+            if (weight is None or not weight.is_cuda or any(weight is w for w, _ in aside)
+                    or weight.dtype not in (torch.float16, torch.bfloat16)):
+                continue
+            half = _fp16_table(weight)
+            if half is not None:
+                aside.append((weight, half))
+                weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+        try:
+            return original(model, *args, **kwargs)
+        finally:
+            for weight, half in aside:
+                weight.data = half
+                weight.requires_grad_(False)
+
+    peft.prepare_model_for_kbit_training = prepare
+    try:
+        from peft import utils as peft_utils
+        from peft.utils import other as peft_other
+    except ImportError:  # pragma: no cover
+        return
+    for namespace in (peft_utils, peft_other):
+        if getattr(namespace, "prepare_model_for_kbit_training", None) is original:
+            namespace.prepare_model_for_kbit_training = prepare
