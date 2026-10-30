@@ -245,7 +245,7 @@ def patch_kbit_preparation():
             namespace.prepare_model_for_kbit_training = prepare
 
 
-MIN_NF4_WEIGHTS = 0  # every 4-bit weight (q/k/v/o too)
+MIN_NF4_WEIGHTS = 1 << 22  # 4.2 M: the MLP projections, not q/k/v/o
 
 
 def patch_nf4_matmul():
