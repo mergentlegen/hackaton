@@ -91,11 +91,12 @@ def silu_mul(gate, up):
 # Cross-entropy over the vocabulary, straight from the fp16 logits.
 # One program per token row: a single pass keeps a running max, sum and sum of exp * logit (online
 # log-sum-exp), so no fp32 copy of the logits and no saved log-softmax exist; only one fp32 number
-# per row is kept. The same pass gives the entropy of the softmax (TRL logs it) when asked.
+# per row is kept. The same pass gives the entropy of the softmax (TRL logs it) and the argmax
+# (first maximal index, like torch.argmax; TRL's token accuracy) when asked: `want` bit 1 and 2.
 # --------------------------------------------------------------------------------------------
-@triton.jit(do_not_specialize=["want_entropy"])
-def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, vocab, want_entropy,
-                    BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=["want"])
+def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, argmax_ptr, vocab,
+                    want, BLOCK: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     target = tl.load(target_ptr + row)
     base = logits_ptr + row * vocab
@@ -103,10 +104,12 @@ def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, voca
     run_max = tl.full([BLOCK], NEG, tl.float32)
     run_sum = tl.zeros([BLOCK], tl.float32)
     run_dot = tl.zeros([BLOCK], tl.float32)
+    run_idx = tl.zeros([BLOCK], tl.int32)
     for start in range(0, vocab, BLOCK):
         idx = start + offs
         mask = idx < vocab
         x = tl.load(base + idx, mask=mask, other=NEG).to(tl.float32)
+        run_idx = tl.where(x > run_max, idx, run_idx)  # first maximum of this lane
         new_max = tl.maximum(run_max, x)
         rescale = tl.exp(run_max - new_max)
         weight = tl.exp(x - new_max)
@@ -121,10 +124,13 @@ def ce_stats_kernel(logits_ptr, target_ptr, lse_ptr, loss_ptr, entropy_ptr, voca
     valid = target >= 0
     tl.store(lse_ptr + row, tl.where(valid, lse, 0.0))
     tl.store(loss_ptr + row, tl.where(valid, lse - picked, 0.0))
-    if want_entropy:
+    if want % 2 == 1:
         dot = tl.sum(run_dot * align, axis=0)
         # entropy of softmax(x) = logsumexp(x) - E[x]
         tl.store(entropy_ptr + row, lse - dot / total)
+    if want >= 2:
+        first = tl.min(tl.where(run_max == row_max, run_idx, 2147483647), axis=0)
+        tl.store(argmax_ptr + row, first.to(tl.int64))
 
 
 @triton.jit
@@ -147,16 +153,22 @@ def ce_backward_kernel(logits_ptr, target_ptr, lse_ptr, scale_ptr, grad_ptr, voc
         tl.store(out + idx, grad.to(grad_ptr.dtype.element_ty), mask=mask)
 
 
-def ce_stats(logits, targets, want_entropy):
+def ce_stats(logits, targets, want_entropy, out=None):
     """Per-row logsumexp, loss (0 for rows with target < 0) and, if asked, entropy of (rows,
-    vocab) logits."""
+    vocab) logits. `out` = (lse, loss, entropy, argmax) buffers to fill, argmax included."""
     rows, vocab = logits.shape
-    lse = torch.empty(rows, dtype=torch.float32, device=logits.device)
-    loss = torch.empty_like(lse)
-    entropy = torch.empty_like(lse) if want_entropy else lse
-    ce_stats_kernel[(rows,)](logits, targets, lse, loss, entropy, vocab, int(want_entropy),
+    if out is not None:
+        lse, loss, entropy, argmax = out
+        want = 3
+    else:
+        lse = torch.empty(rows, dtype=torch.float32, device=logits.device)
+        loss = torch.empty_like(lse)
+        entropy = torch.empty_like(lse) if want_entropy else lse
+        argmax = targets  # not written
+        want = int(want_entropy)
+    ce_stats_kernel[(rows,)](logits, targets, lse, loss, entropy, argmax, vocab, want,
                              BLOCK=CE_BLOCK, num_warps=8)
-    return lse, loss, (entropy if want_entropy else None)
+    return lse, loss, (entropy if want % 2 else None)
 
 
 class FusedCrossEntropy(torch.autograd.Function):

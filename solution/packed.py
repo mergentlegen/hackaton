@@ -20,6 +20,7 @@ attention implementation, ...) goes through the original forward.
 import torch
 
 from .kernels import fused_cross_entropy
+from .lm_loss import linear_cross_entropy
 from .offload import OFFLOADER
 from .packed_logits import PackedLogits
 
@@ -146,18 +147,29 @@ def patch_causal_lm_packed():
                 hidden = model.norm(hidden)
         finally:
             OFFLOADER.end()
-        logits = self.lm_head(hidden)  # (N, vocab), fp16 under autocast
-
         targets = shifted.reshape(-1)[rows]
         items = kwargs.get("num_items_in_batch")
         if items is None:
             denom = (targets != -100).sum().to(torch.float32)
         else:
             denom = torch.as_tensor(items, device=device, dtype=torch.float32)
+
+        lm_head = self.lm_head
+        weight = getattr(lm_head, "weight", None)
+        if (type(lm_head) is torch.nn.Linear and lm_head.bias is None and weight is not None
+                and not weight.requires_grad and weight.dtype == hidden.dtype == torch.float16):
+            # lm_head + loss in chunks of rows, no (N, vocab) logits (lm_loss.py); TRL's and
+            # Soup's metrics read the per-row statistics computed on the way
+            loss, losses, entropy, argmax = linear_cross_entropy(hidden, weight, targets, denom)
+            vocab = weight.shape[0]
+            logits = PackedLogits(None, rows, batch, seq, source=(hidden.detach(), weight, vocab),
+                                  stats=(entropy, argmax, losses, targets))
+            return CausalLMOutputWithPast(loss=loss, logits=logits)
+
+        logits = lm_head(hidden)  # (N, vocab), fp16 under autocast
         # TRL and Soup read the logits for their metrics inside compute_loss, before the backward
         # pass; the backward then writes the loss gradient over them (no second N x vocab buffer)
         loss = fused_cross_entropy(logits, targets, denom, inplace_grad=True)
-
         return CausalLMOutputWithPast(loss=loss, logits=PackedLogits(logits.detach(), rows, batch,
                                                                        seq))
 

@@ -19,9 +19,12 @@ def _is_root(logits):
 def entropy_from_logits(logits, chunk_size=128):
     """Shannon entropy (nats) of softmax(logits) over the last dim; the shape without it."""
     if _is_root(logits):  # packed rows: padding positions get 0, the caller masks them
-        no_target = torch.full((logits.rows.shape[0],), -1, dtype=torch.int64,
-                               device=logits.rows.device)
-        _lse, _loss, entropy = ce_stats(logits.packed, no_target, True)
+        if logits.stats is not None:  # computed with the loss (lm_loss.py)
+            entropy = logits.stats[0]
+        else:
+            no_target = torch.full((logits.rows.shape[0],), -1, dtype=torch.int64,
+                                   device=logits.rows.device)
+            _lse, _loss, entropy = ce_stats(logits.packed, no_target, True)
         out = torch.zeros(logits.batch * logits.seq, dtype=torch.float32, device=entropy.device)
         out[logits.rows] = entropy
         return out.view(logits.batch, logits.seq)
@@ -41,7 +44,11 @@ def row_cross_entropy(logits, labels):
         batch, length = logits.batch, logits.seq
         shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].reshape(-1)
         shifted = shifted.to(logits.rows.device)
-        _lse, losses, _ = ce_stats(logits.packed, shifted[logits.rows], False)
+        targets = shifted[logits.rows]
+        if logits.stats is not None and torch.equal(targets, logits.stats[3]):
+            losses = logits.stats[2]  # the loss's own per-token losses, same targets
+        else:
+            _lse, losses, _ = ce_stats(logits.packed, targets, False)
         per_token = torch.zeros(batch * length, dtype=torch.float32, device=losses.device)
         per_token[logits.rows] = losses
         counts = (shifted >= 0).reshape(batch, length).sum(dim=1)

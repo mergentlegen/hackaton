@@ -22,18 +22,39 @@ import torch
 
 
 class PackedLogits:
-    def __init__(self, packed, rows, batch, seq, lo=0, hi=None, dtype=None):
-        self.packed = packed  # (N, vocab), detached
+    """`packed` (N, vocab) logits, or `source` = (hidden, weight, vocab) with `stats` = per-row
+    (entropy, argmax, losses, targets) already computed by the chunked loss (lm_loss.py): then the
+    logits themselves are only computed (hidden @ weight^T) if something asks for them."""
+
+    def __init__(self, packed, rows, batch, seq, lo=0, hi=None, dtype=None, source=None,
+                 stats=None):
+        self._packed = packed  # (N, vocab), detached
+        self.source, self.stats = source, stats
         self.rows = rows  # (N,) flat index b * seq + t of each real token
         self.batch, self.seq = batch, seq
         self.lo, self.hi = lo, seq if hi is None else hi  # window of positions still visible
-        self._dtype = packed.dtype if dtype is None else dtype  # the dtype it presents
+        self._dtype = (packed.dtype if packed is not None else source[0].dtype) \
+            if dtype is None else dtype  # the dtype it presents
         self._dense = None
+
+    @property
+    def packed(self):
+        if self._packed is None:
+            hidden, weight, _vocab = self.source
+            with torch.no_grad():
+                self._packed = torch.nn.functional.linear(hidden, weight)
+        return self._packed
+
+    def _same(self, lo, hi, dtype):
+        out = PackedLogits(self._packed, self.rows, self.batch, self.seq, lo, hi, dtype,
+                           self.source, self.stats)
+        return out
 
     # ---- what a tensor of shape (batch, window, vocab) answers ----------------------------
     @property
     def shape(self):
-        return torch.Size((self.batch, self.hi - self.lo, self.packed.shape[-1]))
+        vocab = self.source[2] if self._packed is None else self._packed.shape[-1]
+        return torch.Size((self.batch, self.hi - self.lo, vocab))
 
     def size(self, dim=None):
         return self.shape if dim is None else self.shape[dim]
@@ -51,7 +72,7 @@ class PackedLogits:
 
     @property
     def device(self):
-        return self.packed.device
+        return self.rows.device
 
     requires_grad = False
 
@@ -64,11 +85,11 @@ class PackedLogits:
     def _as(self, dtype):
         if dtype == self._dtype:
             return self
-        return PackedLogits(self.packed, self.rows, self.batch, self.seq, self.lo, self.hi, dtype)
+        return self._same(self.lo, self.hi, dtype)
 
     def float(self):
         """fp32 view: the values are exact (see the module docstring), nothing is copied."""
-        return self._as(torch.float32) if self.packed.dtype in (torch.float16, torch.float32) \
+        return self._as(torch.float32) if self._dtype in (torch.float16, torch.float32) \
             else self.dense().float()
 
     def __getitem__(self, key):
@@ -82,14 +103,13 @@ class PackedLogits:
                 and isinstance(key[1], slice) and key[1].step in (None, 1)):
             window = range(self.lo, self.hi)[key[1]]
             if len(window) and window.step == 1:
-                return PackedLogits(self.packed, self.rows, self.batch, self.seq, window.start,
-                                    window.stop, self._dtype)
+                return self._same(window.start, window.stop, self._dtype)
         return self.dense()[key]
 
     def argmax(self, dim=None, keepdim=False):
         if dim not in (-1, 2) or keepdim:
             return self.dense().argmax(dim=dim, keepdim=keepdim)
-        best = self.packed.argmax(dim=-1)
+        best = self.stats[1] if self.stats is not None else self.packed.argmax(dim=-1)
         full = torch.full((self.batch * self.seq,), -1, dtype=best.dtype, device=best.device)
         full[self.rows] = best
         return full.view(self.batch, self.seq)[:, self.lo:self.hi]
@@ -105,8 +125,8 @@ class PackedLogits:
         return self._dense
 
     def __getattr__(self, name):
-        if name.startswith("__") or name in ("packed", "rows", "batch", "seq", "lo", "hi",
-                                             "_dtype", "_dense"):
+        if name.startswith("__") or name in ("_packed", "source", "stats", "rows", "batch",
+                                             "seq", "lo", "hi", "_dtype", "_dense"):
             raise AttributeError(name)
         return getattr(self.dense(), name)
 

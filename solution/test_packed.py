@@ -24,6 +24,14 @@ def test_packed_step_matches_original_forward():
                          num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
                          max_position_embeddings=256)
     model = Qwen2ForCausalLM._from_config(config, attn_implementation="sdpa").cuda().train()
+    # like Soup's model: lm_head tied to a frozen embedding table of fp16-exact values, which the
+    # packed step stores as fp16 and runs through the chunked loss (lm_loss.py)
+    config.tie_word_embeddings = True
+    tied = Qwen2ForCausalLM._from_config(config, attn_implementation="sdpa").cuda().train()
+    embed = tied.model.embed_tokens.weight
+    embed.data = embed.data.half().float()
+    embed.requires_grad_(False)
+    assert tied.lm_head.weight is embed
     lengths = [40, 25, 33]
     ids = torch.randint(0, 1000, (3, 40), device="cuda")
     right = torch.zeros(3, 40, dtype=torch.long, device="cuda")  # varlen attention path
@@ -39,7 +47,7 @@ def test_packed_step_matches_original_forward():
             labels[:, 1:][mask[:, :-1] == 0] = -100
         return labels
 
-    def step(mask, only_real_targets):
+    def step(model, mask, only_real_targets):
         model.zero_grad()
         with torch.autocast("cuda", dtype=torch.float16):
             out = model(input_ids=ids, attention_mask=mask,
@@ -51,11 +59,11 @@ def test_packed_step_matches_original_forward():
 
     # right padding: varlen attention; left padding: padded layout + mask; left padding with a
     # label at a padding position: the original forward
-    cases = ((right, True), (left, True), (left, False))
+    cases = ((model, right, True), (model, left, True), (model, left, False), (tied, right, True))
     refs = [step(*case) for case in cases]
     solution.apply()
-    for (mask, only_real), (ref_loss, ref_logits, ref_grads) in zip(cases, refs):
-        loss, logits, grads = step(mask, only_real)
+    for (net, mask, only_real), (ref_loss, ref_logits, ref_grads) in zip(cases, refs):
+        loss, logits, grads = step(net, mask, only_real)
         torch.testing.assert_close(loss, ref_loss, rtol=3e-3, atol=3e-3)
         assert logits.shape == ref_logits.shape == (3, 40, 1000)
         real = mask.bool()
