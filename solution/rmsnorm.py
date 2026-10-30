@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .offload import OFFLOADER
+
 
 @triton.jit(do_not_specialize=["rows", "mode"])
 def rmsnorm_kernel(x_ptr, w_ptr, y_ptr, rstd_ptr, dy_ptr, dx_ptr, rows, hidden, eps, mode,
@@ -40,7 +42,7 @@ class RMSNorm(torch.autograd.Function):
     weight * x (fp32 here)."""
 
     @staticmethod
-    def forward(ctx, x, weight, eps, to_half=False):
+    def forward(ctx, x, weight, eps, to_half=False, offload=False):
         shape = x.shape
         x2 = x.reshape(-1, shape[-1]).contiguous()
         weight = weight.contiguous()
@@ -55,13 +57,20 @@ class RMSNorm(torch.autograd.Function):
         # call so that both directions are one compiled kernel
         rmsnorm_kernel[(rows,)](x2, weight, out, rstd, out, x2, rows, hidden, eps, 0,
                                 BLOCK=triton.next_power_of_2(hidden), num_warps=8)
-        ctx.save_for_backward(x2, weight, rstd)
+        if offload:  # the fp32 input goes to pinned host memory (offload.py)
+            ctx.item = OFFLOADER.save(x2)
+            ctx.save_for_backward(weight, rstd)
+        else:
+            ctx.save_for_backward(x2, weight, rstd)
         ctx.shape = shape
         return out.reshape(shape)
 
     @staticmethod
     def backward(ctx, dy):
-        x2, weight, rstd = ctx.saved_tensors
+        if hasattr(ctx, "item"):
+            (x2,), (weight, rstd) = OFFLOADER.load(ctx.item), ctx.saved_tensors
+        else:
+            x2, weight, rstd = ctx.saved_tensors
         rows, hidden = x2.shape
         dy2 = dy.reshape(rows, hidden).contiguous()
         dx = torch.empty_like(x2)
@@ -70,8 +79,9 @@ class RMSNorm(torch.autograd.Function):
         dweight = None
         if ctx.needs_input_grad[1]:  # not the case in the task: the norm weights are frozen
             dweight = (dy2.float() * (x2.float() * rstd[:, None])).sum(dim=0).to(weight.dtype)
-        return dx.reshape(ctx.shape), dweight, None, None
+        return dx.reshape(ctx.shape), dweight, None, None, None
 
 
 def rms_norm(x, weight, eps, to_half=False):
-    return RMSNorm.apply(x, weight, eps, to_half)
+    offload = (x.requires_grad or weight.requires_grad) and OFFLOADER.wants(x)
+    return RMSNorm.apply(x, weight, eps, to_half, offload)

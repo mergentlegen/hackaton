@@ -20,6 +20,7 @@ attention implementation, ...) goes through the original forward.
 import torch
 
 from .kernels import fused_cross_entropy
+from .offload import OFFLOADER
 from .packed_logits import PackedLogits
 
 
@@ -135,10 +136,14 @@ def patch_causal_lm_packed():
             causal = torch.ones(seq, seq, dtype=torch.bool, device=device).tril_()
             mask4, row_lengths = causal[None, None] & real[:, None, None, :], None
         packed = (b_idx, t_idx, batch, seq, row_lengths)
-        for layer in model.layers[: config.num_hidden_layers]:
-            hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
-                           position_embeddings=(cos, sin), packed=packed)
-        hidden = model.norm(hidden)
+        OFFLOADER.begin(device)  # MLP and norm activations to pinned host memory (offload.py)
+        try:
+            for layer in model.layers[: config.num_hidden_layers]:
+                hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
+                               position_embeddings=(cos, sin), packed=packed)
+            hidden = model.norm(hidden)
+        finally:
+            OFFLOADER.end()
         logits = self.lm_head(hidden)  # (N, vocab), fp16 under autocast
 
         targets = shifted.reshape(-1)[rows]

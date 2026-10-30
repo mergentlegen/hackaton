@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .offload import OFFLOADER
+
 ACT_BLOCK = 1024
 CE_BLOCK = 4096
 NEG = tl.constexpr(-1.0e30)  # a finite "minus infinity": exp(NEG - x) is 0 and NEG - NEG never gives nan
@@ -50,31 +52,39 @@ def silu_mul_kernel(p0, p1, p2, p3, p4, n_elements, mode, BLOCK: tl.constexpr):
 
 
 class SiluMul(torch.autograd.Function):
-    """silu(gate) * up on fp16 tensors; keeps only gate and up (both fp16) for the backward."""
+    """silu(gate) * up on fp16 tensors; keeps only gate and up (both fp16) for the backward,
+    in pinned host memory when `offload` (offload.py)."""
 
     @staticmethod
-    def forward(ctx, gate, up):
+    def forward(ctx, gate, up, offload):
         gate, up = gate.contiguous(), up.contiguous()
         out = torch.empty_like(gate)
         n = gate.numel()
         silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](gate, up, out, out, out, n, 0,
                                                       BLOCK=ACT_BLOCK)
-        ctx.save_for_backward(gate, up)
+        if offload:
+            ctx.item = OFFLOADER.save(gate, up)
+        else:
+            ctx.save_for_backward(gate, up)
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        gate, up = ctx.saved_tensors
+        if hasattr(ctx, "item"):
+            gate, up = OFFLOADER.load(ctx.item)
+        else:
+            gate, up = ctx.saved_tensors
         dout = dout.contiguous()
         dgate, dup = torch.empty_like(gate), torch.empty_like(up)
         n = gate.numel()
         silu_mul_kernel[(triton.cdiv(n, ACT_BLOCK),)](dout, gate, up, dgate, dup, n, 1,
                                                       BLOCK=ACT_BLOCK)
-        return dgate, dup
+        return dgate, dup, None
 
 
 def silu_mul(gate, up):
-    return SiluMul.apply(gate, up)
+    offload = (gate.requires_grad or up.requires_grad) and OFFLOADER.wants(gate, up)
+    return SiluMul.apply(gate, up, offload)
 
 
 # --------------------------------------------------------------------------------------------
