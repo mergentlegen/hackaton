@@ -107,7 +107,6 @@ def wrap_model_memory():
         before = mib()
         STATE["lm_start"] = before
         if watch:
-            STACK.clear()
             SEEN_PTR.clear()
             SAVED.clear()
             with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
@@ -188,10 +187,19 @@ class Probe(transformers.TrainerCallback):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
+    parser.add_argument("--solution", action="store_true", help="apply solution/ first")
     args = parser.parse_args()
     sys.argv = ["soup", "train", "--config", args.config, "--yes"]
     torch.empty(1, device="cuda")
     wrap_model_memory()
+    if args.solution:
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import solution
+
+        solution.apply()
+        say("solution applied")
 
     original_init = transformers.Trainer.__init__
 
