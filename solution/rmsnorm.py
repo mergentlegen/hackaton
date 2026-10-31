@@ -136,8 +136,11 @@ class AddRMSNorm(torch.autograd.Function):
         rmsnorm_kernel[(rows,)](total, weight, dy2, rstd, dy2, dx, *[d_total] * 4, rows, hidden, 3,
                                 0, 0, 0.0, BLOCK=triton.next_power_of_2(hidden), _c1=0, _c2=0,
                                 _c3=0, num_warps=8)
+        dweight = None
+        if ctx.needs_input_grad[2]:  # not the case in the task: the norm weights are frozen
+            dweight = (dy2.float() * (total * rstd[:, None])).sum(dim=0).to(weight.dtype)
         dx = dx.reshape(ctx.shape)
-        return dx, dx.to(ctx.delta_dtype), None, None, None, None
+        return dx, dx.to(ctx.delta_dtype), dweight, None, None, None
 
 
 def add_rms_norm(residual, delta, weight, eps, to_half=False):
