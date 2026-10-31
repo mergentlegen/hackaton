@@ -1,12 +1,12 @@
 # Submission: hack-1d15670c-team
 
 ## Links
-- Final Commit (Official Repo): https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/284d68e3cf6bb77bd5eebd9e709f91456fbdab02
+- Final Commit (Official Repo): https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/d0d4839aa53eac2219f045eee3b198fbbfb53b68
 - Hackathon Repository: https://github.com/BAITC-Hacks/hack-1d15670c-team
 - Primary GitHub Repository: https://github.com/nursayatdev/nurskernel-byte
 - Public Kaggle notebook (official T4 benchmark): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
-- Demo video (up to 3 minutes): <DEMO_VIDEO_LINK>
-- Presentation: <PRESENTATION_LINK>
+- Demo video (up to 3 minutes): https://github.com/BAITC-Hacks/hack-1d15670c-team/raw/main/demo_video.mp4
+- Presentation: https://github.com/BAITC-Hacks/hack-1d15670c-team/blob/main/presentation.pdf
 
 ## Team
 | Name | Role | GitHub | Kaggle | Contact (captain) |
