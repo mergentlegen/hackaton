@@ -211,7 +211,10 @@ def patch_kbit_preparation():
     again anyway (packed.py, `_fp16_embeddings`: every value is exact in fp16), so the table is
     set aside during the call and put back as the same fp16 values, frozen like peft leaves every
     base weight. Anything that is not an exactly-fp16 table on a GPU goes through peft as is."""
-    import peft
+    try:
+        import peft
+    except ImportError:
+        return
 
     original = peft.prepare_model_for_kbit_training
 
@@ -257,7 +260,10 @@ def patch_nf4_matmul():
     weight bytes) take this path: every launch of a solution kernel costs some CPU time in the
     measured run (the harness wraps it in two CUDA events), and the 112 small q/k/v/o decodes a
     step would add that cost for 11% of the bytes."""
-    import bitsandbytes as bnb
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        return
 
     from .nf4 import can_dequantize, nf4_linear
 
