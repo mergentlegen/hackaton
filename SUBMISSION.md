@@ -1,7 +1,7 @@
 # Сдача: hack-1d15670c-team
 
 ## Ссылки
-- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/4271575
+- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/4141e7dfe0a9c9a6c9443428f6b66649070b85a0
 - Публичный ноутбук Kaggle, сохранённая версия (`COMMIT` в нём = коммит выше; та же ссылка есть в
   README): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
 - Демо-видео (до 3 минут): <ссылка на видео>
