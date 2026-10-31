@@ -41,7 +41,7 @@ Everything plugs in through `solution.apply()` with **zero banned libraries**, *
 
 ### Memory & Compute Optimizations
 - **Padding-Free Packed Forward (`solution/packed.py`)**: Gathers valid non-padding tokens per batch, bypassing ~57% wasted compute and memory across all 28 transformer layers.
-- **Asynchronous Pinned-Host Offloading (`solution/offload.py`)**: Asynchronously streams heavy MLP activations to pinned CPU host memory overlapped with compute stream execution. Buffer thresholds (`KEEP_BYTES = 288 MiB`, `PREFETCH_BYTES = 288 MiB`) keep top layers GPU-resident while prefetching ahead to eliminate PCIe stalls.
+- **Asynchronous Pinned-Host Offloading (`solution/offload.py`)**: Asynchronously streams heavy MLP activations to pinned CPU host memory overlapped with compute stream execution. Buffer thresholds (`KEEP_BYTES = 224 MiB`, `PREFETCH_BYTES = 224 MiB`) keep top layers GPU-resident while prefetching ahead to eliminate PCIe stalls.
 - **GPU Retention of Attention QKV (`solution/attention.py`)**: Keeps lightweight QKV projections (~90 MiB total across all 28 layers) resident on GPU, eliminating 10,752 individual PCIe transfers across the 64-step run.
 - **Chunked Cross-Entropy with Static Buffer Reuse (`solution/lm_loss.py`)**: Computes `hidden @ lm_head.T` in row chunks into a pre-allocated reusable static buffer `_LOGITS_BUF`, eliminating 256 transient 74 MiB allocations per run.
 - **FP16 Embedding Protection & Double-Quant Flattening (`solution/patches.py`)**: Preserves FP16 embedding weights during PEFT kbit initialization and decodes double-quantized nested scales once on step 1.
