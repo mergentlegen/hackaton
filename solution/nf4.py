@@ -64,9 +64,22 @@ def can_dequantize(packed, state):
             and getattr(state, "dtype", None) in (torch.float16, torch.bfloat16, torch.float32))
 
 
-def dequantize_nf4(packed, state):
+_DEQUANT_BUF = None
+
+
+def _get_dequant_buf(shape, dtype, device):
+    global _DEQUANT_BUF
+    numel = _numel(shape)
+    if (_DEQUANT_BUF is None or _DEQUANT_BUF.numel() < numel
+            or _DEQUANT_BUF.device != device or _DEQUANT_BUF.dtype != dtype):
+        _DEQUANT_BUF = torch.empty(max(numel, 13762560), dtype=dtype, device=device)
+    return _DEQUANT_BUF[:numel].view(shape)
+
+
+def dequantize_nf4(packed, state, out=None):
     """The weight `state.shape` in `state.dtype` from its packed NF4 bytes."""
-    out = torch.empty(state.shape, dtype=state.dtype, device=packed.device)
+    if out is None:
+        out = torch.empty(state.shape, dtype=state.dtype, device=packed.device)
     n_out = out.numel()
     code = state.code
     if code.device != packed.device or code.dtype != torch.float32:
@@ -86,7 +99,8 @@ class NF4Linear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, packed, bias, state):
-        weight = dequantize_nf4(packed, state)
+        buf = _get_dequant_buf(state.shape, state.dtype, packed.device)
+        weight = dequantize_nf4(packed, state, out=buf)
         ctx.packed, ctx.state = packed, state
         ctx.bias_dtype = None if bias is None else bias.dtype
         return torch.nn.functional.linear(x, weight.to(x.dtype), bias)
@@ -95,7 +109,8 @@ class NF4Linear(torch.autograd.Function):
     def backward(ctx, grad_output):
         grad_x = grad_bias = None
         if ctx.needs_input_grad[0]:
-            weight = dequantize_nf4(ctx.packed, ctx.state)
+            buf = _get_dequant_buf(ctx.state.shape, ctx.state.dtype, ctx.packed.device)
+            weight = dequantize_nf4(ctx.packed, ctx.state, out=buf)
             grad_x = torch.matmul(grad_output, weight.to(grad_output.dtype))
         if ctx.needs_input_grad[2]:
             grad_bias = grad_output.reshape(-1, grad_output.shape[-1]).sum(0, dtype=ctx.bias_dtype)
