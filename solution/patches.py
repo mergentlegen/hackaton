@@ -1,0 +1,277 @@
+"""Patches that send Soup's Qwen2 training step through our kernels (see kernels.py)."""
+
+import torch
+
+from .kernels import fused_cross_entropy, silu_mul
+from .attention import pack_rows, packed_attention, qkv_rotate
+from .logit_stats import entropy_from_logits, row_cross_entropy
+from .packed_logits import PackedLogits
+from .rmsnorm import rms_norm
+
+
+def _is_4bit_linear(module):
+    try:
+        import bitsandbytes as bnb
+    except ImportError:  # pragma: no cover - bitsandbytes is part of the task environment
+        return False
+    return isinstance(module, bnb.nn.Linear4bit)
+
+
+def patch_qwen2_mlp():
+    """Qwen2MLP in fp16 end to end.
+
+    The reference casts the fp32 stream to fp16 inside every 4-bit linear and casts each result
+    back to fp32, so it keeps three fp32 (tokens, 8960) tensors per layer. Here the input is cast
+    once, the three linears run on fp16 (same values), SwiGLU keeps only its two fp16 inputs, and
+    the output is cast back to the stream's dtype, so the layer returns the same numbers.
+    """
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2MLP.forward
+
+    def forward(self, x):
+        gate_proj, up_proj, down_proj = self.gate_proj, self.up_proj, self.down_proj
+        act = getattr(getattr(self, "config", None), "hidden_act", "silu")
+        if (act != "silu" or not isinstance(x, torch.Tensor) or not x.is_cuda
+                or not all(_is_4bit_linear(m) for m in (gate_proj, up_proj, down_proj))):
+            return original(self, x)
+        compute = getattr(gate_proj, "compute_dtype", None) or torch.float16
+        x16 = x.to(compute)
+        hidden = silu_mul(gate_proj(x16), up_proj(x16))
+        return down_proj(hidden).to(x.dtype)
+
+    modeling_qwen2.Qwen2MLP.forward = forward
+
+
+def patch_causal_lm_loss():
+    """Cross-entropy straight from the logits, without the fp32 copies of transformers' loss."""
+    from transformers.loss import loss_utils
+
+    original = loss_utils.ForCausalLMLoss
+
+    def fused_loss(logits, labels, vocab_size, num_items_in_batch=None, ignore_index=-100,
+                   shift_labels=None, **kwargs):
+        if not isinstance(logits, torch.Tensor) or not logits.is_cuda or ignore_index != -100:
+            return original(logits, labels, vocab_size, num_items_in_batch=num_items_in_batch,
+                            ignore_index=ignore_index, shift_labels=shift_labels, **kwargs)
+        if shift_labels is None:
+            labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
+            shift_labels = labels[..., 1:].contiguous()
+        targets = shift_labels.to(logits.device).reshape(-1)
+        if num_items_in_batch is None:
+            denom = (targets != ignore_index).sum().to(torch.float32)
+        else:
+            denom = torch.as_tensor(num_items_in_batch, device=logits.device,
+                                    dtype=torch.float32)
+        return fused_cross_entropy(logits.reshape(-1, vocab_size), targets, denom)
+
+    loss_utils.ForCausalLMLoss = fused_loss
+    for key, value in list(loss_utils.LOSS_MAPPING.items()):
+        if value is original:
+            loss_utils.LOSS_MAPPING[key] = fused_loss
+
+
+def _autocast_fp16():
+    try:
+        return torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.float16
+    except (TypeError, RuntimeError):  # older torch without the device argument
+        return torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16
+
+
+def patch_qwen2_attention():
+    """Qwen2Attention with the rotation, the fp16 casts and the GQA key/value expansion done by
+    the kernels of attention.py. Anything else (a cache, a sliding window, no mask, another
+    attention implementation, fp16 stream) goes through the original code."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2Attention.forward
+
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None,
+                **kwargs):
+        packed = kwargs.pop("packed", None)
+        if packed is None:  # not the packed training step (packed.py): the original code
+            return original(self, hidden_states, position_embeddings, attention_mask,
+                            past_key_values, **kwargs)
+        b_idx, t_idx, batch, seq, lengths = packed
+        cos, sin = position_embeddings
+        config = self.config
+        q, k, v = (self.q_proj(hidden_states), self.k_proj(hidden_states),
+                   self.v_proj(hidden_states))
+        if lengths is not None:  # right padded: per-sequence attention on the packed rows
+            attn = packed_attention(q, k, v, cos, sin, b_idx, t_idx, seq,
+                                    config.num_attention_heads, config.num_key_value_heads,
+                                    lengths, self.scaling)
+            return self.o_proj(attn), None
+        # otherwise the padded layout and transformers' mask
+        query, key, value = qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq,
+                                       config.num_attention_heads, config.num_key_value_heads,
+                                       True)
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, scale=self.scaling)
+        return self.o_proj(pack_rows(attn, b_idx, t_idx)), None
+
+    modeling_qwen2.Qwen2Attention.forward = forward
+
+
+def patch_qwen2_rmsnorm():
+    """Qwen2RMSNorm as one Triton pass each way (the stream is fp32 in Soup's 4-bit setup)."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2RMSNorm.forward
+
+    def forward(self, hidden_states):
+        weight = self.weight
+        if (hidden_states.is_cuda and hidden_states.dtype == torch.float32
+                and weight.dtype == torch.float32 and weight.is_cuda):
+            # in the fp16 autocast step the consumers cast to fp16 anyway: hand it over as fp16
+            return rms_norm(hidden_states, weight, self.variance_epsilon,
+                            to_half=_autocast_fp16())
+        return original(self, hidden_states)
+
+    modeling_qwen2.Qwen2RMSNorm.forward = forward
+
+
+def patch_logit_metrics():
+    """TRL's per-token entropy and Soup's per-row loss are read from the fp16 logits; run them as
+    single passes over the logits (same quantities, see logit_stats.py)."""
+    try:
+        from trl.trainer import sft_trainer
+        from trl.trainer import utils as trl_utils
+    except ImportError:
+        pass
+    else:
+        original = trl_utils.entropy_from_logits
+
+        def entropy(logits, chunk_size=128):
+            if isinstance(logits, PackedLogits):
+                return entropy_from_logits(logits, chunk_size)
+            if not isinstance(logits, torch.Tensor) or not logits.is_cuda:
+                return original(logits, chunk_size)
+            return entropy_from_logits(logits, chunk_size)
+
+        trl_utils.entropy_from_logits = entropy
+        if hasattr(sft_trainer, "entropy_from_logits"):
+            sft_trainer.entropy_from_logits = entropy
+    try:
+        from soup_cli.trainer import rewind_hf
+    except ImportError:
+        return
+    original_rows = rewind_hf.row_losses
+
+    def row_losses(logits, labels):
+        if isinstance(logits, PackedLogits):
+            with torch.no_grad():
+                return row_cross_entropy(logits, labels)
+        if not isinstance(logits, torch.Tensor) or not logits.is_cuda or logits.dim() != 3:
+            return original_rows(logits, labels)
+        with torch.no_grad():
+            return row_cross_entropy(logits, labels)
+
+    rewind_hf.row_losses = row_losses
+
+
+def patch_trainer_flops():
+    """transformers' Trainer calls `floating_point_ops` after every step, and that walks all ~930
+    modules of the PEFT model twice (`num_parameters(exclude_embeddings=True)`) to get a number
+    that never changes. Same number, computed once per trainer (~15 ms of every step)."""
+    import transformers
+
+    original = transformers.Trainer.floating_point_ops
+
+    def floating_point_ops(self, inputs):
+        model = self.model
+        name = getattr(model, "main_input_name", "input_ids")
+        if name not in inputs or not hasattr(model, "num_parameters"):
+            return original(self, inputs)
+        params = self.__dict__.get("_non_embedding_parameters")
+        if params is None:
+            params = model.num_parameters(exclude_embeddings=True)
+            self.__dict__["_non_embedding_parameters"] = params
+        return 6 * inputs[name].numel() * params
+
+    transformers.Trainer.floating_point_ops = floating_point_ops
+
+
+def _fp16_table(weight):
+    """`weight`'s values as an fp16 tensor if they are all exactly representable, else None."""
+    if weight.dtype == torch.float16:
+        return weight.data
+    half = weight.data.to(torch.float16)
+    for i in range(0, half.shape[0], 16384):
+        if not torch.equal(half[i:i + 16384].to(weight.dtype), weight.data[i:i + 16384]):
+            return None
+    return half
+
+
+def patch_kbit_preparation():
+    """peft's prepare_model_for_kbit_training (Soup calls it for the 4-bit model) casts every
+    fp16 weight to fp32, the frozen embedding table too: while it does, the fp16 table (467 MiB)
+    and its fp32 copy (934 MiB) are both on the GPU, the highest point of the whole run once the
+    training step is lean (offload.py, lm_loss.py). The packed step stores that table as fp16
+    again anyway (packed.py, `_fp16_embeddings`: every value is exact in fp16), so the table is
+    set aside during the call and put back as the same fp16 values, frozen like peft leaves every
+    base weight. Anything that is not an exactly-fp16 table on a GPU goes through peft as is."""
+    import peft
+
+    original = peft.prepare_model_for_kbit_training
+
+    def prepare(model, *args, **kwargs):
+        aside = []
+        for get in ("get_input_embeddings", "get_output_embeddings"):
+            module = getattr(model, get, lambda: None)()
+            weight = getattr(module, "weight", None)
+            if (weight is None or not weight.is_cuda or any(weight is w for w, _ in aside)
+                    or weight.dtype not in (torch.float16, torch.bfloat16)):
+                continue
+            half = _fp16_table(weight)
+            if half is not None:
+                aside.append((weight, half))
+                weight.data = torch.empty(0, dtype=weight.dtype, device=weight.device)
+        try:
+            return original(model, *args, **kwargs)
+        finally:
+            for weight, half in aside:
+                weight.data = half
+                weight.requires_grad_(False)
+
+    peft.prepare_model_for_kbit_training = prepare
+    try:
+        from peft import utils as peft_utils
+        from peft.utils import other as peft_other
+    except ImportError:  # pragma: no cover
+        return
+    for namespace in (peft_utils, peft_other):
+        if getattr(namespace, "prepare_model_for_kbit_training", None) is original:
+            namespace.prepare_model_for_kbit_training = prepare
+
+
+MIN_NF4_WEIGHTS = 1 << 22  # 4.2 M: the MLP projections, not q/k/v/o
+
+
+def patch_nf4_matmul():
+    """bitsandbytes' 4-bit matmul (every Linear4bit forward calls `bnb.matmul_4bit`) through
+    our NF4 decode kernel (nf4.py) when the weight is NF4 with plain fp32 scales and the input
+    is a batch of rows in the weight's compute dtype; anything else goes to bitsandbytes.
+
+    Only the large weights (the three MLP projections, 13.8 M values each: 89% of all 4-bit
+    weight bytes) take this path: every launch of a solution kernel costs some CPU time in the
+    measured run (the harness wraps it in two CUDA events), and the 112 small q/k/v/o decodes a
+    step would add that cost for 11% of the bytes."""
+    import bitsandbytes as bnb
+
+    from .nf4 import can_dequantize, nf4_linear
+
+    original = bnb.matmul_4bit
+
+    def matmul_4bit(A, B, quant_state, out=None, bias=None):
+        state = quant_state
+        if (out is None and state is not None and isinstance(A, torch.Tensor) and A.is_cuda
+                and A.dim() >= 2 and A.numel() // max(A.shape[-1], 1) > 4
+                and len(getattr(state, "shape", ())) == 2 and A.shape[-1] == state.shape[1]
+                and state.shape[0] * state.shape[1] >= MIN_NF4_WEIGHTS
+                and A.dtype == state.dtype and can_dequantize(B, state)
+                and (bias is None or bias.dtype == A.dtype)):
+            return nf4_linear(A, B, bias, state)
+        return original(A, B, quant_state, out=out, bias=bias)
+
+    bnb.matmul_4bit = matmul_4bit
