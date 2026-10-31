@@ -28,25 +28,12 @@ CHUNK_ROWS = 256  # 74 MiB of fp16 logits per chunk
 GRAD_SCALE = 1024.0
 
 
-_LOGITS_BUF = None
-
-def _get_logits_buf(n_rows, vocab, device, dtype):
-    global _LOGITS_BUF
-    if (_LOGITS_BUF is None or _LOGITS_BUF.shape[0] < n_rows or _LOGITS_BUF.shape[1] < vocab
-            or _LOGITS_BUF.device != device or _LOGITS_BUF.dtype != dtype):
-        _LOGITS_BUF = torch.empty(max(n_rows, CHUNK_ROWS), vocab, device=device, dtype=dtype)
-    return _LOGITS_BUF[:n_rows]
-
 def _chunks(hidden, weight, targets, lse, losses, entropy, argmax, unit, grad_hidden):
     rows = hidden.shape[0]
-    vocab = weight.shape[0]
-    weight_t = weight.t()
     for start in range(0, rows, CHUNK_ROWS):
         end = min(start + CHUNK_ROWS, rows)
         part = slice(start, end)
-        n_rows = end - start
-        logits = _get_logits_buf(n_rows, vocab, hidden.device, hidden.dtype)
-        torch.mm(hidden[part], weight_t, out=logits)
+        logits = torch.nn.functional.linear(hidden[part], weight)
         ce_stats(logits, targets[part], True,
                  out=(lse[part], losses[part], entropy[part], argmax[part]))
         ce_grad(logits, targets[part], lse[part], unit, logits)  # 1024 (p - onehot), in place

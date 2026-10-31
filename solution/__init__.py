@@ -21,17 +21,6 @@ from .patches import (patch_causal_lm_loss, patch_kbit_preparation, patch_logit_
 
 
 def apply():
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            try:
-                torch.set_float32_matmul_precision("high")
-            except Exception:
-                pass
-    except Exception:
-        pass
-
     patch_qwen2_mlp()
     patch_qwen2_attention()
     patch_causal_lm_loss()
