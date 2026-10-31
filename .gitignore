@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ipynb_checkpoints/
+
+kaggle_compare/
+kaggle_output_*/
