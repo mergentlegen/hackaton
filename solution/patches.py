@@ -275,3 +275,26 @@ def patch_nf4_matmul():
         return original(A, B, quant_state, out=out, bias=bias)
 
     bnb.matmul_4bit = matmul_4bit
+
+
+def patch_lora():
+    """peft's 4-bit LoRA layer (q_proj, v_proj) through solution/lora.py for the plain case."""
+    try:
+        from peft.tuners.lora import bnb as lora_bnb
+
+        cls = lora_bnb.Linear4bit
+    except (ImportError, AttributeError):  # pragma: no cover - bitsandbytes is in the task
+        return
+    from .lora import fused_forward
+
+    original = cls.forward
+
+    def forward(self, x, *args, **kwargs):
+        if not args and not kwargs:
+            out = fused_forward(self, x)
+            if out is not None:
+                return out
+        return original(self, x, *args, **kwargs)
+
+    forward.peft_forward = original
+    cls.forward = forward
