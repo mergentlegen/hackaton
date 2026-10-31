@@ -1,37 +1,51 @@
-# Submission: hack-1d15670c-team
+# Сдача: hack-1d15670c-team
 
-## Links
-- Final Commit (Official Repo): https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/284d68e3cf6bb77bd5eebd9e709f91456fbdab02
-- Hackathon Repository: https://github.com/BAITC-Hacks/hack-1d15670c-team
-- Primary GitHub Repository: https://github.com/nursayatdev/nurskernel-byte
-- Public Kaggle notebook (official T4 benchmark): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
-- Demo video (up to 3 minutes): <DEMO_VIDEO_LINK>
-- Presentation: <PRESENTATION_LINK>
+## Ссылки
+- Репозиторий, финальный коммит: https://github.com/BAITC-Hacks/hack-1d15670c-team/commit/4271575
+- Публичный ноутбук Kaggle, сохранённая версия (`COMMIT` в нём = коммит выше; та же ссылка есть в
+  README): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
+- Демо-видео (до 3 минут): <ссылка на видео>
+- Презентация: <ссылка на презентацию>
 
-## Team
-| Name | Role | GitHub | Kaggle | Contact (captain) |
+## Команда
+| Имя | Роль | GitHub | Kaggle | Контакт (капитан) |
 |---|---|---|---|---|
-| Nursayat | Captain / ML Systems & Triton Kernels | nursayatdev | nurale | @nursayat |
+| Нурсаят | Капитан, ядра Triton и замеры | nursayatdev | nurale | @nursayat |
+| Мерген Тлеген | Ядра Triton, память и скорость обучения | mergentlegen | mergentlegen | |
 
-## Our Kernels
-| Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
+## Наши ядра
+| Ядро (`@triton.jit`) | Файл | Что заменяет | Доля времени обучения (проверка 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | Vectorized 32-bit word NF4 double-quant dequantizer writing into static reusable buffer `_DEQUANT_BUF` | `6.8%` |
-| `silu_mul_kernel` | `solution/kernels.py` | Unified 2-mode FP16 SwiGLU forward & in-place backward kernel with single compilation | `4.2%` |
-| `rmsnorm_kernel` | `solution/rmsnorm.py` | Unified FP32 residual stream RMSNorm + fused Add-RMSNorm forward & backward kernel | `2.5%` |
-| `qkv_kernel` | `solution/attention.py` | Fused QKV Rotary Position Embedding & GQA head replication (12 heads) + backward accumulation | `1.2%` |
-| `ce_kernel` | `solution/kernels.py` | 2-pass online Cross-Entropy + exact Shannon entropy + token argmax accuracy + backward dlogits | `1.0%` |
-| **Total own kernels (excluding example copies)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`19.1%`** ($\ge 5.0\%$ required) |
+| `nf4_dequant_kernel` | `solution/nf4.py` | Декодирование NF4-весов MLP в bitsandbytes (forward и backward) | 6,8% |
+| `rmsnorm_kernel` | `solution/rmsnorm.py` | RMSNorm и сложение с residual (forward и backward) | 2,3% |
+| `qkv_kernel` | `solution/attention.py` | RoPE, приведение к fp16, раскладку q/k/v по головам и GQA (forward и backward) | 1,6% |
+| `ce_kernel` | `solution/kernels.py` | Кросс-энтропию, энтропию и argmax по словарю, градиент по логитам | 1,1% |
+| `silu_mul_kernel` | `solution/kernels.py` | SwiGLU в MLP — повторяет работу примера, своим не считаем | 5,5% |
+| **Всего** | | | **17,3%** (без `silu_mul_kernel` — **11,9%**, порог 5%) |
 
-## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the benchmark)
-| Metric | Base Soup 0.77.0 | Our Solution | Official Ratio |
+Идеи из других работ, со ссылками (код написали сами):
+- линейный слой + кросс-энтропия кусками: [Liger-Kernel](https://github.com/linkedin/Liger-Kernel), [Cut Your Losses](https://github.com/apple/ml-cross-entropy);
+- выгрузка активаций: [Unsloth](https://github.com/unslothai/unsloth), [torchtune](https://github.com/pytorch/torchtune);
+- RMSNorm на Triton: [туториал Triton](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html);
+- varlen attention с `cu_seqlens`: [FlashAttention](https://github.com/Dao-AILab/flash-attention) (вызываем memory-efficient attention из PyTorch);
+- формат NF4: [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) / QLoRA.
+
+## Результаты на Kaggle T4 (из `runs/result.json` и `runs/checks.json`, `--repeats 2`)
+| | База Soup | Наше решение | Отношение |
 |---|---|---|---|
-| Time of `soup train`, s | `76.81` | **`51.53`** (fastest: **`50.98`**) | speedup **`1.491`x** |
-| Training loop, s | `54.19` | **`29.25`** (fastest: **`28.74`**) | speedup **`1.853`x** |
-| Median step, s | `0.8564` | **`0.3538`** | speedup **`2.421`x** |
-| Peak GPU memory, MiB | `14345` | **`1869`** | base/ours **`7.675`x** (87.0% cut) |
-| Eval loss (public rows) | `2.04966` | **`2.04991`** | **`+0.012`%** vs base ($\le +0.5\%$ rule) |
+| Время `soup train`, с | 87,06 | 55,89 | ускорение 1,558x |
+| Пиковая память GPU, МиБ | 14345 | 1809 | база/наше 7,930x |
+| Eval loss (публичные строки) | 2,04968 | 2,04982 | +0,007% к базе |
 
-- [x] All 10 checks of `harness/check_rules.py` passed (10/10 PASS)
-- [x] Soup regression tests: 79 passed in 0.42s
-- [x] README.md rewritten for our solution: what we did, how to run it, results, limits
+- [x] Все 10 проверок `harness/check_rules.py` пройдены (10/10)
+- [x] README.md переписан под наше решение: что сделали, как запустить, результаты, ограничения
+
+## Что покрывает презентация
+Какие операции ускорили и почему, как работают ядра, результаты против базы (скорость, память,
+качество), ограничения и следующие шаги.
+
+## Ограничения
+Подробно — в разделе 4 README. Коротко: около 21 с команды уходят вне цикла обучения одинаково у
+базы и у решения, шаг упирается в fp16 GEMM cuBLAS, по памяти мы близко к полу (CUDA-контекст и
+4-битные веса, ~1,4 ГБ), всё настроено под конфигурацию задачи на T4, а другие случаи уходят в
+исходный код.

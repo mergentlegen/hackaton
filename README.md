@@ -1,88 +1,182 @@
-# Soup Kernel Challenge — Team `hack-1d15670c-team`
+# Soup Kernel Challenge: команда `hack-1d15670c-team`
 
-Custom `@triton.jit` kernel suite and SM75-aware memory/compute pipeline for `soup train` (`soup-cli==0.77.0`) fine-tuning **Qwen/Qwen2.5-1.5B-Instruct** (4-bit NF4 double-quant, LoRA `r=16, alpha=32` on `q_proj` & `v_proj`) on a single **Kaggle Tesla T4** (15 GiB VRAM, Turing SM75, FP16 AMP).
+`soup train` (`soup-cli==0.77.0`, Qwen2.5-1.5B-Instruct в 4-битном NF4, LoRA r=16 на `q_proj` /
+`v_proj`, батч 4, 64 шага) на Kaggle T4 стал **в 1,558 раза быстрее** и **в 7,930
+раза экономнее по памяти GPU** (14345 → 1809 МиБ) благодаря нашим собственным
+ядрам `@triton.jit` и патчам в `solution/`. Задача не меняется: та же модель, данные, батчи, LoRA
+(включая dropout), оптимизатор, расписание и выходы Soup; loss на отложенных строках +0,007%
+относительно базы.
 
-- **Primary GitHub Repository**: https://github.com/nursayatdev/nurskernel-byte
-- **Hackathon Repository**: https://github.com/BAITC-Hacks/hack-1d15670c-team
-- **Public Kaggle T4 Benchmark Notebook**: https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
+- Публичный ноутбук Kaggle (сохранённая версия, `COMMIT` = сданный коммит): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
+- Форма сдачи: [`SUBMISSION.md`](SUBMISSION.md)
 
----
+## 1. Что мы сделали
 
-## 1. What We Did
+Всё подключается через `solution.apply()` ([`solution/__init__.py`](solution/__init__.py)),
+который патчит transformers, peft и bitsandbytes в момент вызова. Каждый патч проверяет, что он
+находится ровно в том шаге обучения, для которого написан (Qwen2, fp16 autocast, SDPA, есть
+метки, нет кэша KV и т. д.), а иначе вызывает исходный код. Поэтому регрессионные тесты Soup и
+оценка адаптера идут без изменений.
 
-### Root-Cause Bottlenecks in Base `soup train` on Tesla T4 (~14,350 MiB, ~80 s)
-Profiling `soup-cli==0.77.0` + `transformers==5.16.1` + `peft==0.20.0` + `trl==0.29.1` + `bitsandbytes==0.50.2` on Turing SM75 exposed five compounding bottlenecks:
+### Куда уходят время и память в базовом прогоне
 
-1. **Full-Vocabulary Logits & Metrics Spike (~4.25 GiB VRAM + 7% GPU time)**:
-   Materializing `[B=4, S=512, V=151936]` logits alongside FP32 Cross-Entropy upcasts, TRL's `entropy_from_logits` (`log_softmax`), Soup's `rewind.jsonl` per-row loss reduction, and backward `dlogits` simultaneously allocates multiple ~0.6–1.2 GiB tensors.
-2. **PEFT Frozen Embedding Upcast & Residual FP32 Infection (~1.33 GiB load spike + 392 extra casts/step)**:
-   `peft.prepare_model_for_kbit_training` casts every non-`Params4bit` parameter to `fp32`—including the frozen tied `embed_tokens` / `lm_head` matrix `[151936, 1536]` (`445 MiB` $\rightarrow$ `890 MiB`). Because `F.embedding` is not downcast by `torch.amp.autocast`, `inputs_embeds` enters layer 0 in `fp32`, keeping the residual stream in `fp32` across all 28 layers and forcing `fp32 <-> fp16` casts around every quantized projection.
-3. **Un-checkpointed 28-Layer Activations & Unused Training KV Cache (~8 GiB VRAM)**:
-   Saving 28 layers of MLP (`gate`, `up` at `intermediate_size=8960` = `70 MiB/layer` alone), norms, QKV projections, and attention intermediates—plus an unused 28-layer `DynamicCache` allocated because `Qwen2Config.use_cache=True` by default when `gradient_checkpointing=False`—consumes ~8 GiB.
-4. **Right-Padding Waste (~57% tokens) & Turing SM75 GQA SDPA Fallback**:
-   Public training batches (`batch_size=4`, `max_length=512`) have mean length ~220 tokens (median ~140), leaving over half of rectangular `[4, 512]` tensors as padding.
-5. **PCIe Memory Transfer Contention & Dynamic Allocation Churn**:
-   Over-aggressive CPU offloading can choke PCIe bandwidth with thousands of small memory copies, while unbuffered tensor allocations create allocator contention.
+База держит на GPU ~14,3 ГБ: активации 28 слоёв без чекпоинтинга, логиты (4 × 512 × 151 936)
+вместе с их fp32-копиями для loss, энтропией TRL и построчными потерями Soup, а также fp32-копию
+связанной таблицы эмбеддингов, которую делает подготовка peft для 4-битного обучения. На этих
+данных 43% позиций — паддинг (средняя длина 207 токенов, самая длинная строка из четырёх ~360),
+и каждый слой их считает. Время уходит на fp16-матумножения, поэлементные операции и приведения
+типов, softmax по всему словарю и декодирование NF4.
 
----
+### Наши ядра (`@triton.jit`, все написаны нами)
 
-### Our Architecture & Custom `@triton.jit` Kernels (`solution/`)
+| Ядро | Файл | Что делает |
+|---|---|---|
+| `nf4_dequant_kernel` | [`solution/nf4.py`](solution/nf4.py) | Декодирует NF4-веса MLP (gate, up, down) для каждого матумножения, в forward и backward. Один поток на 32-битное слово: 8 весов, одна векторная запись. Побитово совпадает с bitsandbytes (`test_nf4.py`), 165 мкс вместо 209 мкс на весе 8960 × 1536. |
+| `rmsnorm_kernel` | [`solution/rmsnorm.py`](solution/rmsnorm.py) | RMSNorm forward и backward на fp32-потоке residual со встроенным сложением: сложение после attention выполняется внутри post-attention нормы, сложение после MLP — внутри входной нормы следующего слоя (и финальной нормы). Поток residual читается и пишется один раз на сложение. |
+| `qkv_kernel` | [`solution/attention.py`](solution/attention.py) | Поворот RoPE, приведение к fp16 и перестановка из упакованных строк токенов в раскладку по головам для q, k, v (GQA: 12 голов запросов, 2 головы ключей/значений), плюс backward. |
+| `ce_kernel` | [`solution/kernels.py`](solution/kernels.py) | Кросс-энтропия по словарю из 151 936 токенов за один проход на строку: log-sum-exp, loss строки, энтропия и argmax, которые логируют TRL и Soup; затем градиент записывается на место логитов. |
+| `silu_mul_kernel` | [`solution/kernels.py`](solution/kernels.py) | `silu(gate) * up` и его backward для MLP, с выгружаемыми входами. Делает ту же работу, что пример SwiGLU из стартового набора, поэтому мы не считаем его своим: доля без него приведена ниже. |
+| `pack_kernel` | [`solution/attention.py`](solution/attention.py) | Только запасной путь: упакованные строки ↔ раскладка с паддингом, если паддинг не справа (на данных задачи не используется). |
 
-Everything plugs in through `solution.apply()` with **zero banned libraries**, **zero changes to `TRAINER_ARGS`**, and **zero `@triton.autotune`** (every kernel uses `@triton.jit(do_not_specialize=...)` with a shared argument layout to guarantee fast single-compilation on cold start):
+У всех ядер одна раскладка аргументов (10 указателей, 5 int, 1 float, 4 constexpr). Замеряемые
+прогоны стартуют с пустым кэшем компилятора, а Triton собирает по C-лаунчеру на каждую
+уникальную раскладку (~0,23 с на CPU Kaggle), так что он собирается один раз вместо пяти. Forward
+и backward одной операции — одно ядро с параметром `mode`, то есть одна компиляция. Автотюнинга
+нет.
 
-| `@triton.jit` Kernel | File | What It Replaces & How It Works | Share (Check 4) |
-|---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | **Vectorized 32-bit word NF4 double-quant dequantizer**. Unpacks two nibbles per byte, resolves scales directly, and writes decoded weights into a static reused buffer `_DEQUANT_BUF`. | **`6.8%`** |
-| `silu_mul_kernel` | `solution/kernels.py` | **Unified 2-mode FP16 SwiGLU forward & in-place backward kernel**. Computes `silu(gate) * up` in forward and exact gradients in backward within a single compiled kernel. | **`4.2%`** |
-| `rmsnorm_kernel` | `solution/rmsnorm.py` | **Unified FP32 residual stream RMSNorm & fused Add-RMSNorm forward & backward kernel**. Fuses residual additions into normalization with single-pass reduction caching. | **`2.5%`** |
-| `qkv_kernel` | `solution/attention.py` | **Fused QKV Rotary Position Embedding & GQA expansion kernel**. Handles forward rotation + GQA head replication (12 heads) and backward transposed gradient accumulation. | **`1.2%`** |
-| `ce_kernel` | `solution/kernels.py` | **Fused 2-pass online Cross-Entropy + exact Shannon entropy + argmax token accuracy + in-place unscaled dlogits**. Online log-sum-exp without materializing FP32 logits. | **`1.0%`** |
-| **Total own kernels (excluding example copies)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`19.1%`** ($\ge 5.0\%$ required) |
+### Вокруг ядер
 
-### Memory & Compute Optimizations
-- **Padding-Free Packed Forward (`solution/packed.py`)**: Gathers valid non-padding tokens per batch, bypassing ~57% wasted compute and memory across all 28 transformer layers.
-- **Single-Call Cutlass Varlen Attention (`solution/attention.py`)**: Executes memory-efficient causal attention once across all sequences via sequence offsets (`cu_seqlens`) instead of sequential loops.
-- **Fused Decoder Layer Add-RMSNorm (`solution/patches.py`)**: Fuses residual accumulation with input/post-attention layernorms directly in Triton, eliminating 57 separate addition kernels and intermediate memory roundtrips.
-- **Asynchronous Pinned-Host Offloading (`solution/offload.py`)**: Asynchronously streams heavy activations to pinned CPU host memory overlapped with compute stream execution. Buffer thresholds (`KEEP_BYTES = 96 MiB`, `PREFETCH_BYTES = 160 MiB`) maintain ultra-low 1,869 MiB peak VRAM.
-- **Chunked Cross-Entropy with Static Buffer Reuse (`solution/lm_loss.py`)**: Computes `hidden @ lm_head.T` in row chunks into reusable buffer `_LOGITS_BUF`, eliminating transient allocations.
-- **FP16 Embedding Protection & Double-Quant Flattening (`solution/patches.py`)**: Preserves FP16 embedding weights during PEFT kbit initialization and decodes double-quantized nested scales once on step 1.
+- **Без паддинга** ([`solution/packed.py`](solution/packed.py)): реальные токены батча проходят
+  через слои декодера одной матрицей (токены, hidden). При правом паддинге (раскладка Soup)
+  attention — это обычное каузальное внимание каждой строки на саму себя; оно делается одним
+  вызовом memory-efficient attention из PyTorch со смещениями последовательностей
+  (`cu_seqlens`). Строки разных батчей никогда не смешиваются. Любая другая раскладка идёт по
+  пути с паддингом.
+- **lm_head и loss кусками** ([`solution/lm_loss.py`](solution/lm_loss.py)): по 256 строк за раз —
+  логиты → статистика `ce_kernel` → градиент на месте → `grad_hidden`. Логиты размера (токены,
+  словарь) целиком не существуют. Энтропия и точность токенов для TRL и построчные потери для
+  `rewind.jsonl` Soup берутся из статистики, посчитанной по пути
+  ([`solution/packed_logits.py`](solution/packed_logits.py),
+  [`solution/logit_stats.py`](solution/logit_stats.py)), с теми же значениями.
+- **Выгрузка активаций** ([`solution/offload.py`](solution/offload.py)): то, что слои сохраняют для
+  backward, уходит в закреплённую (pinned) память хоста на отдельном потоке копирования, пока GPU
+  считает (13 ГБ/с в каждую сторону на T4), и возвращается заранее, к началу backward. Attention
+  пересчитывается в backward из сохранённых q, k, v. Освобождённые блоки возвращаются аллокатору
+  в порядке потока вместо `record_stream`, который стоил 670 МиБ фрагментации.
+- **Таблица эмбеддингов в fp16**: peft приводит замороженную связанную таблицу эмбеддингов /
+  `lm_head` (233 млн весов) к fp32. Она загружена из fp16, поэтому каждое значение точно
+  представимо в fp16. Мы оставляем её в fp16 (с проверкой по кускам): −467 МиБ и нет fp16-копии
+  для матумножения `lm_head`.
+- **Масштабы двойной квантизации декодируются один раз**: bitsandbytes декодирует 8-битные
+  масштабы NF4 внутри каждого 4-битного матумножения (2 × 196 раз за шаг) в одни и те же fp32-
+  значения; мы декодируем их один раз, как это делает CPU-путь самого bitsandbytes.
 
----
+### Что дал каждый шаг (Kaggle T4, A/B-прогоны в одной сессии)
 
-## 2. How to Run It
+| Шаг | Скорость | Пиковая память |
+|---|---|---|
+| Шаг без паддинга, loss кусками, первые ядра | 1,43x | 1,9x |
+| Выгрузка активаций + пересчёт attention | | 5,1x |
+| lm_head + CE кусками, fp16-эмбеддинги, без `record_stream` | | 7,9x |
+| Своё декодирование NF4 (MLP), общая раскладка аргументов | 1,45x | 7,9x |
+| varlen attention одним вызовом, сложения residual внутри RMSNorm | 1,48x | 7,9x |
 
-### A. On Kaggle (Official Tesla T4 Benchmark)
-1. Open our public notebook: **https://www.kaggle.com/code/nurale/soup-kernel-t4-bench**.
-2. Click **Save & Run All** (~10 minutes). The notebook automatically executes:
-   - `python task/prepare_data.py`
-   - `python harness/run_task.py --repeats 2 --profile`
-   - `python harness/check_rules.py` (verifies all 10 admission checks, including 79 Soup tests $\rightarrow$ `runs/checks.json`)
-   - `python harness/score.py runs/result.json`
+Пробовали и отказались после A/B: декодирование NF4 для всех весов (на 1,9 с медленнее), слитая
+ветка LoRA (без выигрыша), объединённое матумножение gate+up (без выигрыша, +40 МиБ), куски CE
+по 512 строк (+140 МиБ), более длинная предзагрузка (+130 МиБ), постоянные буферы логитов и NF4
+(та же скорость, +60 МиБ).
 
-### B. Locally on a Linux / CUDA Machine
+### Идеи из других работ (код наш)
+
+- Линейный слой + кросс-энтропия кусками без полных логитов:
+  [Liger-Kernel](https://github.com/linkedin/Liger-Kernel) (FusedLinearCrossEntropy) и
+  [Cut Your Losses (Apple)](https://github.com/apple/ml-cross-entropy).
+- Выгрузка активаций в pinned-память: выгрузка градиентов в
+  [Unsloth](https://github.com/unslothai/unsloth), `OffloadActivations` в
+  [torchtune](https://github.com/pytorch/torchtune).
+- Построчный RMSNorm на Triton: [туториал Triton по layer norm](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html).
+- Attention переменной длины с `cu_seqlens`: varlen-интерфейс
+  [FlashAttention](https://github.com/Dao-AILab/flash-attention) (мы вызываем собственный
+  memory-efficient attention из PyTorch, без библиотек).
+- Формат и декодирование NF4: [bitsandbytes](https://github.com/bitsandbytes-foundation/bitsandbytes) / QLoRA.
+
+## 2. Как запустить
+
+**На Kaggle** (засчитываются только эти цифры): откройте публичный ноутбук выше (или
+импортируйте `templates/kaggle_notebook.ipynb`), Accelerator **GPU T4 x2**, Internet on, укажите
+этот репозиторий в первой ячейке и нажмите **Run All** (~15 минут). Ноутбук ставит закреплённые
+версии пакетов, готовит данные, запускает наши тесты, затем `harness/run_task.py` (база и
+решение), `harness/check_rules.py` и `harness/score.py`.
+
+**Локально** на Linux с CUDA GPU (засчитываются только цифры с T4: новые GPU обучаются в bf16, где
+наш fp16-путь отключается):
+
 ```bash
 pip install "soup-cli[train]==0.77.0" "transformers==5.16.1" "peft==0.20.0" "trl==0.29.1" \
     "bitsandbytes==0.50.2" "accelerate==1.14.0" pytest
-
-python task/prepare_data.py                     # writes data/train.jsonl & data/eval_public.jsonl
-python -m pytest solution -v                    # 11 correctness & parity tests
-SOUP_APPLY_SOLUTION=1 python -m pytest tests -q # 79 Soup regression tests
-python harness/run_task.py --repeats 2          # runs base & solution -> runs/result.json
-python harness/check_rules.py                   # verifies all 10 checks -> runs/checks.json
-python harness/score.py runs/result.json        # prints speedup (s), memory ratio (m) & quality
+python task/prepare_data.py                      # data/train.jsonl, data/eval_public.jsonl
+python -m pytest solution -q                     # 44 теста: наши ядра и шаги против PyTorch / bitsandbytes
+SOUP_APPLY_SOLUTION=1 python -m pytest tests -q  # 79 регрессионных тестов Soup с нашими патчами
+python harness/run_task.py --repeats 2           # база, решение, решение, база -> runs/result.json
+python harness/check_rules.py                    # 10 проверок -> runs/checks.json
+python harness/score.py runs/result.json
 ```
 
----
+В `tools/` лежат скрипты анализа, которыми мы пользовались (профили, пропускная способность PCIe,
+время компиляции, варианты NF4); замеряемый прогон их не использует.
 
-## 3. Official Benchmark Results on Kaggle Tesla T4
+## 3. Результаты
 
-| Metric | Base Soup 0.77.0 | Solution (Our Record Run) | Official Improvement | Rule / Requirement |
-|---|---|---|---|---|
-| Whole `soup train` wall time (`wall_s`) | `76.81` s | **`51.53` s** (fastest: **`50.98` s**) | **`1.491x` faster** | $\le 1.10\times$ margin (**PASS**) |
-| 64-step training loop (`train_loop_s`) | `54.19` s | **`29.25` s** (fastest: **`28.74` s**) | **`1.853x` faster** | Measurable speedup (**PASS**) |
-| Median step time (`median_step_s`) | `0.8564` s | **`0.3538` s** | **`2.421x` faster** | Steady-state throughput (**PASS**) |
-| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`1,869` MiB** | **`7.675x` lower (87.0% cut)** | $\le 1.10\times$ margin (**PASS**) |
-| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04991`** | **`+0.012%` parity** | $\le +0.5\%$ rule (**PASS**) |
-| Own `@triton.jit` share (Check 4, steps 3+) | — | **`19.1%`** | **`3.82x` above minimum** | $\ge 5.0\%$ required (**PASS**) |
-| Soup regression tests (Check 10) | — | **`79 passed in 0.42s`** | **`100% test pass rate`** | 79 passed required (**PASS**) |
-| `harness/check_rules.py` (10 / 10 checks) | — | **`10 / 10 PASS`** | **`100% Admission Passed`** | All 10 checks required (**PASS**) |
+Kaggle T4, `python harness/run_task.py --repeats 2` (база, решение, решение, база — порядок жюри),
+публичные строки, коммит `4271575` (`solution_sha256` из `runs/checks.json`: `c6f9e6ff…`; прогон клонировал зеркало mergentlegen/hackaton@ffd6179 с побайтно тем же `solution/`):
+
+| | База Soup 0.77.0 | Наше решение | Отношение |
+|---|---|---|---|
+| Вся команда `soup train`, с (медиана из 2) | 87,06 | **55,89** | быстрее в **1,558x** |
+| 64 шага обучения, с | 60,15 | 32,66 | 1,842x |
+| Медианный шаг, с | 0,953 | 0,423 | 2,254x |
+| Пиковая память GPU (nvidia-smi), МиБ | 14345 | **1809** | меньше в **7,930x** |
+| Максимум выделенной памяти PyTorch, МиБ | 13373,2 | 1497,5 | |
+| Loss на отложенных строках (публичные) | 2,04968 | 2,04982 | +0,007% |
+
+`harness/check_rules.py`: пройдено **10/10** проверок. Наши ядра занимают **17,3%**
+времени обучения (проверка 4, худший прогон, шаги 3+), без `silu_mul_kernel` —
+**11,9%**:
+
+| Ядро | Доля времени обучения |
+|---|---|
+| `nf4_dequant_kernel` | 6,8% |
+| `silu_mul_kernel` | 5,5% |
+| `rmsnorm_kernel` | 2,3% |
+| `qkv_kernel` | 1,6% |
+| `ce_kernel` | 1,1% |
+
+Машины Kaggle различаются: в разных сессиях тот же код показывал 1,41x–1,56x на всей команде
+(одна только база гуляет на ±5%); цикл обучения и память стабильны.
+
+## 4. Ограничения
+
+- **Всю команду сильно не сократить.** 23–27 с команды проходят вне цикла обучения и почти
+  одинаковы у базы и у решения (импорты Python, загрузка модели, данные, сохранение адаптера), а
+  первый шаг решения платит ~4 с за компиляцию Triton и закрепление памяти хоста. Поэтому цикл
+  обучения у нас быстрее в 1,84 раза, а вся команда — в 1,56.
+- **Упираемся в матумножения на GPU.** Шаг — это ~0,39 с занятого GPU, в основном fp16 GEMM
+  cuBLAS по замороженным весам, которые мы оставляем cuBLAS. Остальная поэлементная работа —
+  несколько процентов.
+- **Пол по памяти.** CUDA-контекст (~170 МиБ) и 4-битные веса с fp16-таблицей эмбеддингов
+  (~1,2 ГБ) никуда не деваются; мы на ~1,8 ГБ. Ниже — только выгружать веса, а это стоит времени.
+- **Память хоста и PCIe.** Выгрузке нужно ~2,3 ГБ закреплённой оперативной памяти и пропускная
+  способность PCIe у T4; размеры подобраны под длины последовательностей задачи (до 512 токенов).
+- **Область применения.** Настроено и проверено под эту задачу: Qwen2, fp16 autocast на T4, SDPA,
+  правый паддинг. Всё остальное (bf16-GPU, другие модели, левый паддинг, оценка, генерация) уходит
+  в исходный код или в более медленный путь с паддингом: остаётся корректным, но выигрывает
+  меньше.
+- **Следующие шаги**, которые не успели проверить: хранить выход attention вместо пересчёта
+  (время против памяти), упаковать маски dropout LoRA в биты, сократить синхронизации с хостом в
+  начале шага.
+
+## Лицензия
+
+Apache-2.0, см. `LICENSE` и `NOTICE`. Пять файлов тестов в `tests/` взяты из Soup v0.77.0
+(Apache-2.0). Данные: [AmanMussa/kazakh-instruction-v2](https://huggingface.co/datasets/AmanMussa/kazakh-instruction-v2),
+модель: [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct).
