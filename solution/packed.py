@@ -23,6 +23,7 @@ from .kernels import fused_cross_entropy
 from .lm_loss import linear_cross_entropy
 from .offload import OFFLOADER
 from .packed_logits import PackedLogits
+from .rmsnorm import add_rms_norm
 
 
 def _autocast_fp16():
@@ -76,6 +77,42 @@ def _flatten_quant_states(model):
             absmax = absmax.float()
         state.absmax = absmax
         state.nested = False
+
+
+def _fusable_norm(norm):
+    weight = getattr(norm, "weight", None)
+    return (isinstance(weight, torch.Tensor) and weight.is_cuda and weight.dtype == torch.float32
+            and hasattr(norm, "variance_epsilon"))
+
+
+def _run_layers(model, layers, hidden, mask4, position_ids, position_embeddings, packed):
+    """The decoder layers and the final norm. Every residual add runs inside the RMSNorm that
+    reads its result (rmsnorm.py `add_rms_norm`): the add after attention in the layer's
+    post-attention norm, the add after the MLP in the next layer's input norm (and the last one
+    in the final norm), so the fp32 residual stream is read and written once per add instead of
+    twice, with one kernel instead of two. Same sums (fp32 + fp16 in fp32), same norms."""
+    norms = [model.norm] + [m for layer in layers
+                            for m in (getattr(layer, "input_layernorm", None),
+                                      getattr(layer, "post_attention_layernorm", None))]
+    if hidden.dtype != torch.float32 or not all(_fusable_norm(norm) for norm in norms):
+        for layer in layers:
+            hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
+                           position_embeddings=position_embeddings, packed=packed)
+        return model.norm(hidden)
+    to_half = _autocast_fp16()
+    residual, delta = hidden, None
+    for layer in layers:
+        norm, post = layer.input_layernorm, layer.post_attention_layernorm
+        if delta is None:
+            h = norm(residual)
+        else:
+            residual, h = add_rms_norm(residual, delta, norm.weight, norm.variance_epsilon, to_half)
+        h, _ = layer.self_attn(hidden_states=h, attention_mask=mask4, position_ids=position_ids,
+                               position_embeddings=position_embeddings, packed=packed)
+        residual, h = add_rms_norm(residual, h, post.weight, post.variance_epsilon, to_half)
+        delta = layer.mlp(h)
+    final = model.norm
+    return add_rms_norm(residual, delta, final.weight, final.variance_epsilon, to_half)[1]
 
 
 def patch_causal_lm_packed():
@@ -141,10 +178,8 @@ def patch_causal_lm_packed():
         OFFLOADER.begin(device)
         try:
             with torch.autograd.graph.saved_tensors_hooks(OFFLOADER.pack, OFFLOADER.unpack):
-                for layer in model.layers[: config.num_hidden_layers]:
-                    hidden = layer(hidden, attention_mask=mask4, position_ids=position_ids,
-                                   position_embeddings=(cos, sin), packed=packed)
-                hidden = model.norm(hidden)
+                hidden = _run_layers(model, model.layers[: config.num_hidden_layers], hidden,
+                                     mask4, position_ids, (cos, sin), packed)
         finally:
             OFFLOADER.end()
         targets = shifted.reshape(-1)[rows]
