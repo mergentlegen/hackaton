@@ -7,7 +7,8 @@
 (включая dropout), оптимизатор, расписание и выходы Soup; loss на отложенных строках +0,007%
 относительно базы.
 
-- Публичный ноутбук Kaggle (сохранённая версия, `COMMIT` = сданный коммит): https://www.kaggle.com/code/nurale/soup-kernel-t4-bench
+- Публичный ноутбук Kaggle (сохранённая версия, `COMMIT` = сданный коммит `4141e7d`): https://www.kaggle.com/code/mergentlegen/soup-kernel-t4-hack-1d15670c-team
+  Командный репозиторий закрытый, поэтому ноутбук клонирует его публичное зеркало https://github.com/mergentlegen/hackaton (ветка `team-main`) — коммиты там те же, с теми же хэшами.
 - Форма сдачи: [`SUBMISSION.md`](SUBMISSION.md)
 
 ## 1. Что мы сделали
