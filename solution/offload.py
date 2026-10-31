@@ -26,9 +26,9 @@ every step (bump allocation): pinning happens only when a step needs more than a
 
 import torch
 
-KEEP_BYTES = 224 << 20  # newest bytes left on the GPU at the end of the forward
-LAG_BYTES = 96 << 20  # copies in flight before the compute stream waits for the oldest
-PREFETCH_BYTES = 224 << 20  # bytes on their way back ahead of the backward
+KEEP_BYTES = 288 << 20  # newest bytes left on the GPU at the end of the forward
+LAG_BYTES = 128 << 20  # copies in flight before the compute stream waits for the oldest
+PREFETCH_BYTES = 288 << 20  # bytes on their way back ahead of the backward
 MIN_BYTES = 512 << 10  # smaller saved tensors stay where they are
 CHUNK = 256 << 20  # bytes of pinned host memory per chunk
 ALIGN = 512
