@@ -15,7 +15,7 @@ The rules in short (the README and the task statement have the full ones):
 
 from .packed import patch_causal_lm_packed
 from .patches import (patch_causal_lm_loss, patch_kbit_preparation, patch_logit_metrics,
-                      patch_lora, patch_nf4_matmul,
+                      patch_nf4_matmul,
                       patch_qwen2_attention, patch_qwen2_mlp, patch_qwen2_rmsnorm,
                       patch_trainer_flops)
 
@@ -30,4 +30,3 @@ def apply():
     patch_trainer_flops()
     patch_kbit_preparation()
     patch_nf4_matmul()
-    patch_lora()
