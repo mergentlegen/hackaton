@@ -5,8 +5,8 @@
 - Публичный ноутбук Kaggle, сохранённая версия (`COMMIT` в нём = коммит выше; та же ссылка есть в
   README): https://www.kaggle.com/code/mergentlegen/soup-kernel-t4-hack-1d15670c-team?scriptVersionId=364287887
   Командный репозиторий закрытый, поэтому ноутбук клонирует его публичное зеркало https://github.com/mergentlegen/hackaton (ветка `team-main`) — коммиты там те же, с теми же хэшами.
-- Демо-видео (до 3 минут): <ссылка на видео>
-- Презентация: <ссылка на презентацию>
+- Демо-видео (до 3 минут): https://github.com/BAITC-Hacks/hack-1d15670c-team/raw/main/demo_video.mp4
+- Презентация: https://github.com/BAITC-Hacks/hack-1d15670c-team/blob/main/presentation.pdf
 
 ## Команда
 | Имя | Роль | GitHub | Kaggle | Контакт (капитан) |
