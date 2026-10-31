@@ -32,18 +32,19 @@ Everything plugs in through `solution.apply()` with **zero banned libraries**, *
 
 | `@triton.jit` Kernel | File | What It Replaces & How It Works | Share (Check 4) |
 |---|---|---|---|
-| `nf4_dequant_kernel` | `solution/nf4.py` | **Vectorized 32-bit word NF4 double-quant dequantizer**. Unpacks two nibbles per byte, resolves scales directly, and writes decoded weights into a static reused buffer `_DEQUANT_BUF`. | **`6.3%`** |
-| `silu_mul_kernel` | `solution/kernels.py` | **Unified 2-mode FP16 SwiGLU forward & in-place backward kernel**. Computes `silu(gate) * up` in forward and exact gradients in backward within a single compiled kernel. | **`4.1%`** |
-| `rmsnorm_kernel` | `solution/rmsnorm.py` | **Unified FP32 residual stream RMSNorm forward & backward kernel**. Single-pass reduction caching 1 FP32 `rstd` scalar per token row (`4 B`). | **`1.1%`** |
-| `qkv_kernel` | `solution/attention.py` | **Fused QKV Rotary Position Embedding & GQA expansion kernel**. Handles forward rotation + GQA head replication (12 heads) and backward transposed gradient accumulation. | **`1.1%`** |
-| `ce_kernel` | `solution/kernels.py` | **Fused 2-pass online Cross-Entropy + exact Shannon entropy + argmax token accuracy + in-place unscaled dlogits**. Online log-sum-exp without materializing FP32 logits. | **`0.9%`** |
-| **Total own kernels (excluding example copies)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`17.2%`** ($\ge 5.0\%$ required) |
+| `nf4_dequant_kernel` | `solution/nf4.py` | **Vectorized 32-bit word NF4 double-quant dequantizer**. Unpacks two nibbles per byte, resolves scales directly, and writes decoded weights into a static reused buffer `_DEQUANT_BUF`. | **`6.8%`** |
+| `silu_mul_kernel` | `solution/kernels.py` | **Unified 2-mode FP16 SwiGLU forward & in-place backward kernel**. Computes `silu(gate) * up` in forward and exact gradients in backward within a single compiled kernel. | **`4.2%`** |
+| `rmsnorm_kernel` | `solution/rmsnorm.py` | **Unified FP32 residual stream RMSNorm & fused Add-RMSNorm forward & backward kernel**. Fuses residual additions into normalization with single-pass reduction caching. | **`2.5%`** |
+| `qkv_kernel` | `solution/attention.py` | **Fused QKV Rotary Position Embedding & GQA expansion kernel**. Handles forward rotation + GQA head replication (12 heads) and backward transposed gradient accumulation. | **`1.2%`** |
+| `ce_kernel` | `solution/kernels.py` | **Fused 2-pass online Cross-Entropy + exact Shannon entropy + argmax token accuracy + in-place unscaled dlogits**. Online log-sum-exp without materializing FP32 logits. | **`1.0%`** |
+| **Total own kernels (excluding example copies)** | `solution/` | **Complete end-to-end non-GEMM compute & dequantization suite** | **`19.1%`** ($\ge 5.0\%$ required) |
 
 ### Memory & Compute Optimizations
 - **Padding-Free Packed Forward (`solution/packed.py`)**: Gathers valid non-padding tokens per batch, bypassing ~57% wasted compute and memory across all 28 transformer layers.
-- **Asynchronous Pinned-Host Offloading (`solution/offload.py`)**: Asynchronously streams heavy MLP activations to pinned CPU host memory overlapped with compute stream execution. Buffer thresholds (`KEEP_BYTES = 224 MiB`, `PREFETCH_BYTES = 224 MiB`) keep top layers GPU-resident while prefetching ahead to eliminate PCIe stalls.
-- **GPU Retention of Attention QKV (`solution/attention.py`)**: Keeps lightweight QKV projections (~90 MiB total across all 28 layers) resident on GPU, eliminating 10,752 individual PCIe transfers across the 64-step run.
-- **Chunked Cross-Entropy with Static Buffer Reuse (`solution/lm_loss.py`)**: Computes `hidden @ lm_head.T` in row chunks into a pre-allocated reusable static buffer `_LOGITS_BUF`, eliminating 256 transient 74 MiB allocations per run.
+- **Single-Call Cutlass Varlen Attention (`solution/attention.py`)**: Executes memory-efficient causal attention once across all sequences via sequence offsets (`cu_seqlens`) instead of sequential loops.
+- **Fused Decoder Layer Add-RMSNorm (`solution/patches.py`)**: Fuses residual accumulation with input/post-attention layernorms directly in Triton, eliminating 57 separate addition kernels and intermediate memory roundtrips.
+- **Asynchronous Pinned-Host Offloading (`solution/offload.py`)**: Asynchronously streams heavy activations to pinned CPU host memory overlapped with compute stream execution. Buffer thresholds (`KEEP_BYTES = 96 MiB`, `PREFETCH_BYTES = 160 MiB`) maintain ultra-low 1,869 MiB peak VRAM.
+- **Chunked Cross-Entropy with Static Buffer Reuse (`solution/lm_loss.py`)**: Computes `hidden @ lm_head.T` in row chunks into reusable buffer `_LOGITS_BUF`, eliminating transient allocations.
 - **FP16 Embedding Protection & Double-Quant Flattening (`solution/patches.py`)**: Preserves FP16 embedding weights during PEFT kbit initialization and decodes double-quantized nested scales once on step 1.
 
 ---
@@ -77,11 +78,11 @@ python harness/score.py runs/result.json        # prints speedup (s), memory rat
 
 | Metric | Base Soup 0.77.0 | Solution (Our Record Run) | Official Improvement | Rule / Requirement |
 |---|---|---|---|---|
-| Whole `soup train` wall time (`wall_s`) | `78.06` s | **`52.70` s** | **`1.481x` faster** | $\le 1.10\times$ margin (**PASS**) |
-| 64-step training loop (`train_loop_s`) | `54.59` s | **`30.11` s** | **`1.813x` faster** | Measurable speedup (**PASS**) |
-| Median step time (`median_step_s`) | `0.8459` s | **`0.3666` s** | **`2.307x` faster** | Steady-state throughput (**PASS**) |
-| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`1,931` MiB** | **`7.429x` lower (86.5% cut)** | $\le 1.10\times$ margin (**PASS**) |
-| Held-out public eval loss (`eval_adapter.py`) | `2.04965` | **`2.04983`** | **`+0.009%` parity** | $\le +0.5\%$ rule (**PASS**) |
-| Own `@triton.jit` share (Check 4, steps 3+) | — | **`17.2%`** | **`3.44x` above minimum** | $\ge 5.0\%$ required (**PASS**) |
-| Soup regression tests (Check 10) | — | **`79 passed in 0.53s`** | **`100% test pass rate`** | 79 passed required (**PASS**) |
+| Whole `soup train` wall time (`wall_s`) | `76.81` s | **`51.53` s** (fastest: **`50.98` s**) | **`1.491x` faster** | $\le 1.10\times$ margin (**PASS**) |
+| 64-step training loop (`train_loop_s`) | `54.19` s | **`29.25` s** (fastest: **`28.74` s**) | **`1.853x` faster** | Measurable speedup (**PASS**) |
+| Median step time (`median_step_s`) | `0.8564` s | **`0.3538` s** | **`2.421x` faster** | Steady-state throughput (**PASS**) |
+| Peak GPU memory (`nvidia-smi`, `gpu_peak_mib`) | `14,345` MiB | **`1,869` MiB** | **`7.675x` lower (87.0% cut)** | $\le 1.10\times$ margin (**PASS**) |
+| Held-out public eval loss (`eval_adapter.py`) | `2.04966` | **`2.04991`** | **`+0.012%` parity** | $\le +0.5\%$ rule (**PASS**) |
+| Own `@triton.jit` share (Check 4, steps 3+) | — | **`19.1%`** | **`3.82x` above minimum** | $\ge 5.0\%$ required (**PASS**) |
+| Soup regression tests (Check 10) | — | **`79 passed in 0.42s`** | **`100% test pass rate`** | 79 passed required (**PASS**) |
 | `harness/check_rules.py` (10 / 10 checks) | — | **`10 / 10 PASS`** | **`100% Admission Passed`** | All 10 checks required (**PASS**) |
