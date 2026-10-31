@@ -4,9 +4,10 @@ A batch is 4 sequences padded to the longest, and on this data 43% of its positi
 (mean length 207 tokens, but the longest of four is ~360). The packed forward (packed.py) runs
 every per-token op (projections, norms, MLP, LoRA, lm_head, loss) on the N real tokens only.
 
-Attention itself runs one causal scaled_dot_product_attention per sequence on the packed rows
-(`varlen_attention`), so it never computes, stores or differentiates padding positions: with the
-padding on the right a sequence's real tokens are one contiguous block of the packed rows. Only a
+Attention itself runs the memory-efficient attention kernel once over the packed rows with the
+sequence boundaries (`varlen_attention`), so it never computes, stores or differentiates padding
+positions: with the padding on the right a sequence's real tokens are one contiguous block of the
+packed rows. Only a
 batch with another padding layout falls back to the padded (B, heads, T, D) layout and
 transformers' mask (`layout` 1 below, plus `pack_rows`).
 
@@ -191,21 +192,54 @@ def qkv_rotate(q, k, v, cos, sin, b_idx, t_idx, batch, seq, heads, kv_heads, pad
     return QKVRotate.apply(q, k, v, cos, sin, b_idx, t_idx, batch, seq, heads, kv_heads, padded)
 
 
+_CU_SEQLENS = {}
+
+
+def _cu_seqlens(lengths, device):
+    """int32 [0, l0, l0 + l1, ...] on the GPU, built once per batch shape (28 layers share it)."""
+    key = (device, tuple(lengths))
+    cu = _CU_SEQLENS.get(key)
+    if cu is None:
+        if len(_CU_SEQLENS) > 16:
+            _CU_SEQLENS.clear()
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + int(length))
+        cu = _CU_SEQLENS[key] = torch.tensor(offsets, dtype=torch.int32, device=device)
+    return cu
+
+
+class VarlenAttention(torch.autograd.Function):
+    """Causal attention of every sequence of the batch in ONE call of the memory-efficient
+    (cutlass) attention kernel that scaled_dot_product_attention itself runs on a T4, given the
+    sequence boundaries (`cu_seqlens`) instead of one call per sequence plus a concatenation.
+    Inputs (N, H, D) fp16 packed rows (the BSHD layout with B = 1), output (N, H * D)."""
+
+    @staticmethod
+    def forward(ctx, query, key, value, cu_seqlens, max_len, scale):
+        q, k, v = query[None], key[None], value[None]
+        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+            q, k, v, None, cu_seqlens, cu_seqlens, max_len, max_len, 0.0, 1, True, scale=scale)
+        ctx.save_for_backward(q, k, v, out, lse, seed, offset, cu_seqlens)
+        ctx.max_len, ctx.scale = max_len, scale
+        return out[0].reshape(query.shape[0], -1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        q, k, v, out, lse, seed, offset, cu_seqlens = ctx.saved_tensors
+        dq, dk, dv, _ = torch.ops.aten._efficient_attention_backward(
+            grad.reshape(out.shape).contiguous(), q, k, v, None, out, cu_seqlens, cu_seqlens,
+            ctx.max_len, ctx.max_len, lse, 0.0, seed, offset, 1, False, scale=ctx.scale)
+        return dq[0], dk[0], dv[0], None, None, None
+
+
 def varlen_attention(query, key, value, lengths, scale):
     """Causal attention of each sequence on its own, on packed (N, H, D) fp16 rows where
-    sequence i is the contiguous block of `lengths[i]` rows; returns (N, H * D).
-
-    `split` gives views (its backward is one concatenation), and the transposes are views too,
-    so the only copy forward is the final `cat` of the outputs."""
-    outputs = []
-    for q, k, v in zip(query.split(lengths), key.split(lengths), value.split(lengths)):
-        if q.shape[0] == 0:  # an all-padding row has no tokens to attend
-            continue
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None],
-            dropout_p=0.0, is_causal=True, scale=scale)
-        outputs.append(out[0].transpose(0, 1).reshape(q.shape[0], -1))
-    return torch.cat(outputs)
+    sequence i is the contiguous block of `lengths[i]` rows; returns (N, H * D)."""
+    lengths = [int(length) for length in lengths if int(length) > 0]
+    cu_seqlens = _cu_seqlens(lengths, query.device)
+    return VarlenAttention.apply(query.contiguous(), key.contiguous(), value.contiguous(),
+                                 cu_seqlens, max(lengths), scale)
 
 
 def _attend(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale):

@@ -6,7 +6,7 @@ from .kernels import fused_cross_entropy, silu_mul
 from .attention import pack_rows, packed_attention, qkv_rotate
 from .logit_stats import entropy_from_logits, row_cross_entropy
 from .packed_logits import PackedLogits
-from .rmsnorm import rms_norm
+from .rmsnorm import add_rms_norm, rms_norm
 
 
 def _is_4bit_linear(module):
@@ -275,3 +275,36 @@ def patch_nf4_matmul():
         return original(A, B, quant_state, out=out, bias=bias)
 
     bnb.matmul_4bit = matmul_4bit
+
+
+def patch_qwen2_decoder_layer():
+    """In the packed training step (packed.py), the residual add after attention and the
+    post-attention RMSNorm as one kernel (rmsnorm.py `add_rms_norm`); otherwise the original."""
+    from transformers.models.qwen2 import modeling_qwen2
+
+    original = modeling_qwen2.Qwen2DecoderLayer.forward
+
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None,
+                use_cache=False, cache_position=None, position_embeddings=None, **kwargs):
+        post = getattr(self, "post_attention_layernorm", None)
+        weight = getattr(post, "weight", None)
+        if (kwargs.get("packed") is None or past_key_values is not None or use_cache
+                or not isinstance(hidden_states, torch.Tensor) or not hidden_states.is_cuda
+                or hidden_states.dtype != torch.float32 or weight is None
+                or weight.dtype != torch.float32 or not weight.is_cuda
+                or not hasattr(post, "variance_epsilon")):
+            return original(self, hidden_states, attention_mask=attention_mask,
+                            position_ids=position_ids, past_key_values=past_key_values,
+                            use_cache=use_cache, cache_position=cache_position,
+                            position_embeddings=position_embeddings, **kwargs)
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states, attention_mask=attention_mask, position_ids=position_ids,
+            past_key_values=past_key_values, use_cache=use_cache, cache_position=cache_position,
+            position_embeddings=position_embeddings, **kwargs)
+        residual, hidden_states = add_rms_norm(residual, hidden_states, weight,
+                                               post.variance_epsilon, to_half=_autocast_fp16())
+        return residual + self.mlp(hidden_states)
+
+    modeling_qwen2.Qwen2DecoderLayer.forward = forward

@@ -70,3 +70,29 @@ def test_row_losses_match_soup():
                                                   reduction="none", ignore_index=-100)
         assert counts[i] == int(mask.sum())
         assert abs(losses[i] - float(token[mask].mean())) < 1e-4 * max(1.0, losses[i])
+
+
+@pytest.mark.parametrize("to_half", [True, False])
+def test_add_rmsnorm_matches_add_then_rmsnorm(to_half):
+    from solution.rmsnorm import add_rms_norm, rms_norm
+
+    torch.manual_seed(0)
+    residual = torch.randn(300, 1536, device="cuda", requires_grad=True)
+    delta = torch.randn(300, 1536, device="cuda").half().requires_grad_()
+    weight = torch.rand(1536, device="cuda") + 0.5
+    g_total = torch.randn(300, 1536, device="cuda")
+    g_out = torch.randn(300, 1536, device="cuda")
+
+    total = residual + delta
+    out = rms_norm(total, weight, 1e-6, to_half=to_half)
+    torch.autograd.backward([total, out], [g_total, g_out.to(out.dtype)])
+    ref = [total.detach(), out.detach(), residual.grad.clone(), delta.grad.clone()]
+    residual.grad = delta.grad = None
+
+    total, out = add_rms_norm(residual, delta, weight, 1e-6, to_half=to_half)
+    torch.autograd.backward([total, out], [g_total, g_out.to(out.dtype)])
+    mine = [total.detach(), out.detach(), residual.grad, delta.grad]
+    assert torch.equal(mine[0], ref[0])  # the sum is the same fp32 addition
+    for a, b in zip(mine[1:], ref[1:]):
+        assert a.dtype == b.dtype
+        torch.testing.assert_close(a.float(), b.float(), rtol=1e-3, atol=1e-3)
