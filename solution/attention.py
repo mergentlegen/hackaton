@@ -245,8 +245,10 @@ class PackedAttention(torch.autograd.Function):
         return (*grads, None, None, None, None, None, None, None, None, None, None)
 
 
+OFFLOAD_ATTENTION = False  # q, k, v is only ~90 MiB across all 28 layers; keeping it on GPU saves 10,752 PCIe transfers!
+
 def packed_attention(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths, scale):
-    offload = OFFLOADER.wants(q, k, v) and (q.requires_grad or k.requires_grad or v.requires_grad)
+    offload = OFFLOAD_ATTENTION and OFFLOADER.wants(q, k, v) and (q.requires_grad or k.requires_grad or v.requires_grad)
     return PackedAttention.apply(q, k, v, cos, sin, b_idx, t_idx, seq, heads, kv_heads, lengths,
                                  scale, offload)
 
